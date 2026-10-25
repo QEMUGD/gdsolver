@@ -1,3 +1,92 @@
+# v0.6.1
+
+ * **The Play menu opens for every online or downloaded level on GD 2.2091** (Geode's name for the hotfix executable of 2.209, the one Steam
+   has now). A click on Play could start the level without the mod's menu: the check that decides whether the level page has finished loading
+   read a member of the page at the position it has in the first 2.209 executable, and 2.2091 has one more member before it. The mod now reads
+   the member where each executable keeps it. The solver is the same as in v0.6.0.
+
+# v0.6.0
+
+ * **Geometry Dash 2.2091 (Windows).** This version is built for GD 2.2091 on Steam,
+   Geode's name for the hotfix of 2.209. The first 2.209 executable and the hotfix
+   carry one version string, the hotfix moved nearly every function, and Geode checks
+   only the version string. So before it hooks anything the mod checks the executable
+   it is in (the build stamps of GeometryDash.exe, libcocos2d.dll and
+   libExtensions.dll). On a game it was not built for it stays off, writes one line to
+   the log, shows one line on screen, and the game plays as if it were not installed.
+   Geode does not support 2.2091 yet and runs in its forward-compatibility mode, where
+   its own menus are not available, so the mod brings its own popups, scrolling and
+   keys. These stopgaps, the executable check among them, go once Geode supports
+   2.2091.
+ * **No Android build this time.** The Android game is on the new version too, and
+   there is no Android port of its bindings yet. v0.5.0's Android pre-release stays
+   as it was, for GD 2.2081.
+ * **All 22 main levels clear on 2.2091**, cold, in one game session: in 27 repairs
+   for the end of the level (v0.5.0 on 2.2081: 35) and in 33 with every coin (v0.5.0:
+   60). The paths are the same on the first 2.209 executable.
+ * **The levels the game features.** A new survey took 126 custom levels from the
+   game's own lists: 50 of the last year's Daily levels, the last 50 Weekly levels
+   and every Event level in the Safe list, each solved cold at the release defaults
+   in up to 20 minutes, on GD 2.2081 just before this release. 74 cleared: 41 of 50
+   Daily, 23 of 50 Weekly (demons) and 10 of 26 Event levels. See
+   docs/CUSTOM_LEVELS.md.
+ * **Section search can be turned off.** Under Solve, Options has a **Section
+   search** box, ticked by default. Unticked, a wall the model cannot get past is
+   never handed to the search of the game itself, so a level that needs it is not
+   solved. (`dpsecauto=0` is the same switch.)
+ * **Avoid glitches is a three-way choice**, with arrows: **Off** (the default),
+   **Glitches only** (the old box: the searches drop the routes that rest on
+   frame-level glitches), and **Glitches + wave**, experimental. Glitches + wave adds
+   the wave's behaviour. The wave's button is not planned to change faster than a
+   hand can, the wave keeps a clearance from the floor, the ceiling and solids
+   instead of crawling along them, and among the routes left it prefers fewer button
+   changes and a line nearer the middle of its corridor. Where no route keeps all
+   that, it eases in steps for that stretch only, and takes one step back every
+   900 px past the wall. Each step is said on screen. A choice saved from the old
+   box reads as Glitches only or Off.
+ * **Every option has an (i) button** that says what each of its values means, in a
+   popup that scrolls. The menu keeps one line naming what is not at its default.
+ * **Hold Play to open the menu.** A box in Options makes a click on a level's play
+   button just play it, as without the mod, and opens the menu when the button is
+   held (a ring fills around it while you hold). The menu is always one hold away,
+   so the setting can always be turned back.
+ * **The yellow note names a version.** On a custom level with objects from 2.0 on,
+   the play menu now says which version the newest of them came in ("Its newest
+   objects are from 2.2"). Which levels get the note is unchanged.
+ * **The replay panel** (`Tab`). While a solve runs with the screen dark, the free
+   area from the middle of the screen to the top-right plays GD's own record of the
+   deepest attempt the game has verified: the level's boxes, the path, the moving
+   parts, the corrections. `Tab` goes round the whole verified path, its last
+   stretch and off. While it is on screen, `F2`, `F3`, `F4` and the arrows stop,
+   step, seek and pace it. It is never drawn over the showing of the solution, and
+   it starts empty on every level. See docs/REPLAY_PANEL.md.
+ * **Solve faster is gone** from the settings. The cfg key `dpplainbeside=3` still
+   does it.
+ * **More of the model is on by default.** The rules added since v0.5.0 that showed
+   no harm on the main levels, and that did not make the model part from the game
+   sooner on the recorded attempts of 124 custom levels, are on: among them the
+   speed a wall needs is asked of the model, a long level's late deaths rank, and a
+   dozen fidelity rules for rotated frames, dash rings, drop rings, spiders, robots
+   and the wave on ramps. Two were measured to do harm and stay off. A rule can
+   still change the route a custom level's search takes, and with it the time.
+ * **171 solver switches and 17 cfg keys are gone**, the ones that only ever turned
+   off a rule that has been on by default for a release or more. A removed switch or
+   key is refused by name, with the commit that fixed its behaviour. The list is
+   dp/removed_flags.txt.
+ * **Fixed:** a level with very many triggers could take tens of gigabytes while
+   the solver kept its restart points, and stop the game on a machine short of
+   memory (the saved points now keep only what changes). A search step could read
+   memory an earlier step had freed, which on some custom levels took the game
+   down. `F10` could leave the iteration map's path on the level after it was
+   hidden.
+ * **Nothing is recorded while it drives, on 2.2091 too.** Since 2.209 the game has
+   a death tracker that uploads where players die. While the bot drives, that upload and
+   the other new records (play time, the death sessions) are blocked like the rest.
+   Each session's log ends with a memory audit of the save, which should read
+   `none` for the level's record.
+ * **For developers:** py/divergence_view.py draws, in a browser and without the
+   game, where the model parts from GD's own record of an attempt.
+
 # v0.5.0
 
  * **Fewer repairs, and more custom levels clear.** In one game session, cold, all

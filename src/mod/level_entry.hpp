@@ -2,8 +2,10 @@
 // Entering a level the mod names itself: auto-enter, the level suite and the mid-session
 // swap. A level the player picks goes through the game's own play button and the play menu
 // (hooks_playmenu.cpp).
+#include "mod/gd_compat.hpp"
 #include "mod/helpers_game.hpp"
 #include "mod/level_warnings.hpp"
+#include "mod/window_guard.hpp"
 
 using namespace p1;
 
@@ -19,6 +21,34 @@ inline int levelHeaderTwoPlayer(std::string s) {
     if (s.empty()) return -1;
     const std::string_view all(s);
     return levelwarn::field(all.substr(0, all.find(';')), "kA10") == "1" ? 1 : 0;
+}
+
+// Whether the level's attempt-dependent triggers reach play (levelwarn::kAttemptDependent), read from
+// the stored or raw string the way the play menu's note reads it.
+inline bool levelAttemptDependent(std::string s) {
+    const size_t b = s.find_first_not_of(" \t\r\n");
+    if (b == std::string::npos) return false;
+    s = s.substr(b);
+    if (s.rfind("H4sI", 0) == 0) s = std::string(cocos2d::ZipUtils::decompressString(s, false, 0));
+    if (s.empty()) return false;
+    const std::string_view all(s);
+    const bool platformer = levelwarn::field(all.substr(0, all.find(';')), "kA22") == "1";
+    return (levelwarn::scan(all, platformer).unmodelled & levelwarn::kAttemptDependent) != 0;
+}
+
+// cfg attemptauto for a level the play menu started: the same decision enterConfiguredLevel makes for a
+// level the mod names itself, from the level object the game is entering. Called after the session is
+// configured (its result file is open).
+inline void attemptAutoForLevel(GJGameLevel* level) {
+    g_attemptAutoCount = -1;
+    if (!level || !g_attemptAuto || g_attemptOne || g_attemptCount >= 0) return;
+    const std::string str = level->m_levelType == GJLevelType::Main
+        ? std::string(LocalLevelManager::sharedState()->getMainLevelString(level->m_levelID.value()))
+        : std::string(level->m_levelString);
+    if (!levelAttemptDependent(str)) return;
+    g_attemptAutoCount = 1;
+    writeResult("attemptauto: the level reads the attempt count or keeps items across attempts "
+                "into play; driven as attempt 1 would be a later one (attemptcount=1)");
 }
 
 // ---- where a suite level comes from (cfg `leveldir`, see suite:: in config.hpp) ----
@@ -93,7 +123,8 @@ inline bool enterConfiguredLevel() {
                     + " where the suite is at " + std::to_string(suite::current()));
         return false;
     }
-    // Main levels are 1-22; anything else is a saved / online-cached custom level
+    // Main levels are 1-22, and the official platformer levels 5001-5004 (the game's own resources,
+    // no download); anything else is a saved / online-cached custom level
     GJGameLevel* level = nullptr;
     auto* glm = GameLevelManager::sharedState();
     std::string srcKind, srcBytes;   // for the `levelsource:` line below
@@ -114,12 +145,12 @@ inline bool enterConfiguredLevel() {
         level->m_levelType = g_cfg.levelFileMain ? GJLevelType::Main : GJLevelType::Editor;
         // Run it through GD's own compression. Doing base64+gzip by hand here silently
         // fails to load because of encoding differences, so ALWAYS hand it to ZipUtils.
-        level->m_levelString = cocos2d::ZipUtils::compressString(raw, false, 0);
+        level->m_levelString = gdcompat::compressLevelString(raw);
         log::info("phase1: built the level from levelfile {} ({} chars)",
                   g_cfg.levelFile, raw.size());
         srcKind = "file";
         srcBytes = raw;
-    } else if (g_cfg.levelId >= 1 && g_cfg.levelId <= 22) {
+    } else if ((g_cfg.levelId >= 1 && g_cfg.levelId <= 22) || (g_cfg.levelId >= 5001 && g_cfg.levelId <= 5004)) {
         level = glm->getMainLevel(g_cfg.levelId, false);
         srcKind = "main";
     } else {
@@ -139,6 +170,18 @@ inline bool enterConfiguredLevel() {
     if (srcKind != "file") srcBytes = std::string(level->m_levelString);
     writeResult("levelsource: id=" + std::to_string(g_cfg.levelId) + " kind=" + srcKind
                 + " sig=" + levelContentSig(srcBytes) + " bytes=" + std::to_string(srcBytes.size()));
+    // cfg attemptauto: decided afresh at every entry, so a pin never outlives its level.
+    g_attemptAutoCount = -1;
+    if (g_attemptAuto && !g_attemptOne && g_attemptCount < 0) {
+        const std::string fullStr = srcKind == "main"
+            ? std::string(LocalLevelManager::sharedState()->getMainLevelString(g_cfg.levelId))
+            : srcBytes;
+        if (levelAttemptDependent(fullStr)) {
+            g_attemptAutoCount = 1;
+            writeResult("attemptauto: the level reads the attempt count or keeps items across attempts "
+                        "into play; driven as attempt 1 would be a later one (attemptcount=1)");
+        }
+    }
     // Line for ruling out the suspicion that the calibration rig (levelfile=) and the
     // official levels have DIFFERENT physics. The rig's gravity-flipped ship climbed at
     // 0.069/tick while the same condition in lv7 gave 0.103. Compares the defaults of
@@ -155,6 +198,8 @@ inline bool enterConfiguredLevel() {
                                  : srcBytes),
         (int)level->m_twoPlayerMode, (int)level->m_objectCount).c_str());
     log::info("phase1: entering level {}", g_cfg.levelId);
+    // the window back at its launch size before the level loads (window_guard.hpp)
+    if (g_cfg.windowGuard) windowguard::enforce("level entry", true, [](const std::string& s) { writeResult(s); });
     g_forceCleanStart = true;
     auto* scene = PlayLayer::scene(level, false, false);
     CCDirector::sharedDirector()->replaceScene(CCTransitionFade::create(0.5f, scene));
@@ -188,7 +233,7 @@ inline bool swapLevelNow(const std::string& path) {
     level->m_levelName = "gdsolver swap";
     level->m_levelID = g_cfg.levelId;
     level->m_levelType = g_cfg.levelFileMain ? GJLevelType::Main : GJLevelType::Editor;
-    level->m_levelString = cocos2d::ZipUtils::compressString(raw, false, 0);
+    level->m_levelString = gdcompat::compressLevelString(raw);
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - g_swapT0).count();
     g_forceCleanStart = true;
@@ -235,7 +280,7 @@ public:
                         + ") - the remaining levels are not run");
             writeResult("suite: done " + std::to_string(suite::g_levels.size()) + " levels");
             if (g_cfg.quitWhenDone)
-                Loader::get()->queueInMainThread([] { utils::game::exit(false); });
+                Loader::get()->queueInMainThread([] { gdcompat::exitGame(); });
             return;
         }
         if (++suite::g_settle < kSettleTicks) return;
@@ -255,7 +300,7 @@ public:
         if (!suiteLevelSource()) {
             writeResult("suite: done " + std::to_string(suite::g_levels.size()) + " levels");
             if (g_cfg.quitWhenDone)
-                Loader::get()->queueInMainThread([] { utils::game::exit(false); });
+                Loader::get()->queueInMainThread([] { gdcompat::exitGame(); });
             return;
         }
         writeResult("suite: level=" + std::to_string(g_cfg.levelId)
@@ -278,6 +323,6 @@ public:
         }
         writeResult("suite: done " + std::to_string(suite::g_levels.size()) + " levels");
         if (g_cfg.quitWhenDone)
-            Loader::get()->queueInMainThread([] { utils::game::exit(false); });
+            Loader::get()->queueInMainThread([] { gdcompat::exitGame(); });
     }
 };

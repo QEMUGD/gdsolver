@@ -199,6 +199,33 @@ struct PlanEdge {
     int level;         // ...and to what
 };
 
+// --start-state (statefile.hpp): the button state the plan starts from, by PRESS tick, as --start's
+// hold field names it (the caller's heldBefore over the prefix it splices onto). The state's own
+// `held` is the physics' (a cube's is never written), so the edges are counted from this instead,
+// which is what a call seeded from the game's anchor counts them from. -1 = not a --start-state call.
+inline int g_planPrevHeld = -1;
+
+// --needsize <tick>:<0|1>: player 1 must be normal (0) or mini (1) on that tick; the search drops
+// every state that is not (a rule, not the game's physics). The loop asks it of a search that begins
+// before an optional size change when the game has shown that only the other size gets over the
+// wall ahead (src/mod/repair.hpp, cfg dpsecstate): "be that size at the wall" lets the route take an
+// unavoidable portal and the one that undoes it, which "never change the size" cannot. -1 = off.
+inline long long g_needSizeT = -1;
+inline int g_needSizeMini = 0;
+
+// --needspeed <x>:<multiplier> / <x>:!<multiplier>: the state that crosses x must be at that speed (0.7 / 0.9 / 1.1 /
+// 1.3 / 1.6) as it does, or must not be (the "!" form); the search drops every one that breaks it (a rule, not the
+// game's physics). The same question as --needsize, for the speed: a route that took an optional speed portal can reach a
+// wall only another speed gets over. It is asked by x and not by tick because the speeds do not share a clock: at
+// the same tick a faster state is already further on, and "be at another speed when you reach the wall" is
+// the same for every one of them. A state that starts at or past x is not asked. Negative x = off.
+inline double g_needSpeedX = -1.0;
+inline int g_needSpeedCode = 0;
+inline bool g_needSpeedNot = false;
+inline int planPrevHeld(const State& init) {
+    return g_planPrevHeld >= 0 ? g_planPrevHeld : (int)init.held;
+}
+
 // `modeAt[i]` is the mode at the END of tick t0+i+1, `prevHeld` the button state the plan
 // starts from and `initMode` the anchor's mode (used when the lookback reaches before tick 0).
 inline std::vector<PlanEdge> planEdges(const std::vector<uint8_t>& lvl,
@@ -679,6 +706,16 @@ inline void planFromArena(const std::vector<Node>& arena, const State& goal,
 // globals it writes (autonomous and rotation triggers, statistics, the rejoin node), and the
 // moving geometry's carried placement per bound frame. --ladderprefixcheck (cliMain) runs such an
 // attempt both ways and compares plan, trace and outcome.
+// What a search writes into an AutoTrig: model.hpp fireAutoTriggers, the lock window in dynamics.hpp, the
+// witness and rollout walks. The rest of it (the controls, toggles and stops: ~1 GB on a level with a
+// hundred thousand objects) is built once per call by loadAutoTriggers and never changes, so a save keeps
+// these four and the resumed attempt, which loaded the same triggers, gets them back.
+struct AutoFireState {
+    int fireT = -1;
+    double fireX = 0.0;
+    int fireSpreadT = 0;
+    double lockLastX = 0.0;
+};
 struct LadderPrefixSnap {
     long long T = -1;
     std::vector<State> cur;
@@ -696,7 +733,7 @@ struct LadderPrefixSnap {
     SearchCensus census;
     TwinStats twin;
     long long workStates = 0;
-    std::vector<AutoTrig> autoTrig;
+    std::vector<AutoFireState> autoFire;   // per g_autoTrig entry
     std::vector<RotTrig> rotTrig;
     std::vector<std::vector<double>> carry;   // per frame 0..3, empty when not bound
     std::vector<uint8_t> carryOn;
@@ -706,6 +743,14 @@ struct LadderPrefixSnap {
     long long rjJoinT = -1;
     uint32_t rjOldNode = 0xffffffffu;
     size_t layerXSize = 0;
+    // What this save holds allocated, for the cap on all of them (g_ladderPrefixMaxMiB).
+    size_t bytes() const {
+        size_t n = sizeof(*this) + cur.capacity() * sizeof(State) + objRefs.capacity() * sizeof(uint64_t)
+                   + autoFire.capacity() * sizeof(AutoFireState) + rotTrig.capacity() * sizeof(RotTrig)
+                   + carry.capacity() * sizeof(std::vector<double>) + carryOn.capacity();
+        for (const std::vector<double>& c : carry) n += c.capacity() * sizeof(double);
+        return n;
+    }
 };
 struct LadderPrefixCache {
     bool active = false;        // this call is a ladder attempt under --ladderprefix (cliMain)
@@ -717,6 +762,13 @@ struct LadderPrefixCache {
     bool usable = false;        // the last attempt ended normally, so its saves can be resumed
     int resume = -1;            // index into snaps to start this attempt from (cliMain), -1 = t0
     long long resumedFrom = -1; // what this call started from, for the account
+    // ...and at most this much in all (--ladderprefixmaxmib, read by cliMain), oldest dropped first; the newest
+    // save is always kept. A save is one frontier plus the loop's counters, a few MiB at a frontier of
+    // thousands of states, so 64 of them sit well under the default; the cap is there so that whatever a
+    // save grows to hold can never again run the process out of memory unseen (the search's own budget,
+    // g_memLimitMiB, does not count them).
+    size_t maxMiB = 1024;
+    bool capSaid = false;       // the over-the-cap line has been printed for this ladder
 };
 inline LadderPrefixCache g_lpc;            // --ladderprefix / --ladderprefixcheck are read by cliMain
 inline int g_ladderPrefixEvery = 64;       // save every N layers
@@ -784,7 +836,8 @@ inline int searchLayers(E& e, const Rules& rules, SearchResult& out) {
     g_lpc.resumedFrom = -1;
     const long long lpWork0 = g_outcome.workStates;   // what the call had before this loop
     if (lpOn && g_lpc.usable && g_lpc.t0 == t0 && g_lpc.resume >= 0
-        && (size_t)g_lpc.resume < g_lpc.snaps.size()) {
+        && (size_t)g_lpc.resume < g_lpc.snaps.size()
+        && g_lpc.snaps[(size_t)g_lpc.resume].autoFire.size() == g_autoTrig.size()) {
         LadderPrefixSnap S = g_lpc.snaps[(size_t)g_lpc.resume];
         cur = S.cur;
         for (size_t i = 0; i < cur.size(); ++i) {   // the pointers into THIS attempt's level
@@ -818,7 +871,14 @@ inline int searchLayers(E& e, const Rules& rules, SearchResult& out) {
         census = S.census;
         twin = S.twin;
         g_outcome.workStates = lpWork0 + S.workStates;   // the loop's own work up to T
-        g_autoTrig = S.autoTrig;
+        for (size_t i = 0; i < g_autoTrig.size(); ++i) {   // the entries are this attempt's own; the fire state is the save's
+            AutoTrig& A = g_autoTrig[i];
+            const AutoFireState& F = S.autoFire[i];
+            A.fireT = F.fireT;
+            A.fireX = F.fireX;
+            A.fireSpreadT = F.fireSpreadT;
+            A.lockLastX = F.lockLastX;
+        }
         g_rotTrig = S.rotTrig;
         for (int f = 0; f < 4; ++f)
             if (S.carryOn[(size_t)f]) model.loadWorld(f, S.carry[(size_t)f], S.T);
@@ -1119,15 +1179,14 @@ inline int searchLayers(E& e, const Rules& rules, SearchResult& out) {
         // pass of its own, under the flag only: the loop above is the layer's hottest (one helper
         // call in it cost lv22's search 3%, see its note), so nothing of the flag's goes in it.
         float gD2Lo = 0.f, gD2Hi = 0.f;
-        if (g_p2xOff)
-            for (size_t ci = 0; ci < cur.size(); ++ci) {
-                const State& s = cur[ci];
-                if (!model.inGroup(gkey, s, curDxF) || sigOf(ci) != gkey.fsig || xcOf(ci) != gkey.xc)
-                    continue;
-                const float d2 = p2Dx(s);
-                gD2Lo = std::min(gD2Lo, d2);
-                gD2Hi = std::max(gD2Hi, d2);
-            }
+        for (size_t ci = 0; ci < cur.size(); ++ci) {
+            const State& s = cur[ci];
+            if (!model.inGroup(gkey, s, curDxF) || sigOf(ci) != gkey.fsig || xcOf(ci) != gkey.xc)
+                continue;
+            const float d2 = p2Dx(s);
+            gD2Lo = std::min(gD2Lo, d2);
+            gD2Hi = std::max(gD2Hi, d2);
+        }
         // The gate's pass count: this group is APPROXIMATED only if its members
         // disagree about when the trigger fired. Counted here, before any of the
         // reasons below can `continue` past it, so "placed" means placed.
@@ -1147,7 +1206,9 @@ inline int searchLayers(E& e, const Rules& rules, SearchResult& out) {
             bool missed = false;
             for (size_t b = 0; b < g_touch.size() && !missed; ++b)
                 if ((g_needTrig & ~gtrig) & touchBit(b))
-                    missed = gLo > g_touch[b].cx + g_touch[b].hw + 40.0;
+                    // --needtrigrev (triggers.hpp): a reversed group passes a box going left
+                    missed = (g_needTrigRev && grev) ? gHi < g_touch[b].cx - g_touch[b].hw - 40.0
+                                                     : gLo > g_touch[b].cx + g_touch[b].hw + 40.0;
             if (missed) continue;
         }
         const double xPrev = gHi;                    // nominal, reports only
@@ -1166,7 +1227,8 @@ inline int searchLayers(E& e, const Rules& rules, SearchResult& out) {
         // --autoown (dynamics.hpp): this group's own crossings for the autonomous triggers, for its
         // placement and its step; the leader's come back when the group is done.
         AutoOwnGuard autoOwn;
-        if (g_autoOwn && gframe == 0 && !grev) autoOwnApply(autoOwn, gHi, (double)gdx, t);
+        g_autoOwnT0 = t0;   // --autoownpre (dynamics.hpp); the same value from every thread
+        if (gframe == 0 && !grev) autoOwnApply(autoOwn, gHi, (double)gdx, t);
         GroupEnv env;
         double pLo = wLo, pHi = wHi;
         p2Widen(pLo, pHi, gD2Lo, gD2Hi);   // --p2xoff
@@ -1300,6 +1362,27 @@ inline int searchLayers(E& e, const Rules& rules, SearchResult& out) {
         // --inputgrid / --gridmap: this layer's grid, from the leader x of the layer before it
         // (the x --capmap reads, so a ladder window lifts both over the same stretch).
         const int gridNow = gridAtX(bestX);
+        // --airpressnear (with --airpress): the air press child is kept only where a landing is within
+        // reach. A press held from the air into a landing is one future whatever tick in the arc it began
+        // on (the buffer is set at the first and the states merge once it is), so the children of the
+        // ticks long before any surface add expansions and no reachable state.
+        auto landingNear = [&](const State& s) -> bool {
+            constexpr double n = 8.0, g = 0.958;
+            const double px = (double)s.xAbs, vy = (double)s.vy;
+            const double foot = (double)s.y - 15.0;
+            const double lb = foot - 0.5 * g * n * n - std::max(0.0, -vy) * n;
+            const double ub = foot + std::max(0.0, vy) * n + 1.0;
+            const double rx = 15.0 + n * std::fabs((double)K.dxF);
+            auto hit = [&](const std::vector<const Obj*>& v, bool solidOnly) {
+                for (const Obj* o : v) {
+                    if (solidOnly && o->type != 0) continue;
+                    const double top = o->cy + o->hh;
+                    if (top >= lb && top <= ub && std::fabs(o->cx - px) <= o->hw + rx) return true;
+                }
+                return false;
+            };
+            return hit(near, true) || hit(slps, false);
+        };
         auto stepKidAt = [&](size_t i, bool mayTwin) {
             const State& s = cur[gidx[i >> 1]];
             const int input = (int)(i & 1);
@@ -1315,7 +1398,8 @@ inline int searchLayers(E& e, const Rules& rules, SearchResult& out) {
             // is the only one left.
             if (input == 1 && s.mode == 0 && !s.grounded && orbsEmpty
                 && !s.dashing && !(s.dual && s.dashing2)   // --dualdash
-                && !nearPressBox(s) && !nearCtrlHoldBox((double)s.xAbs) && !g_airPress
+                && !nearPressBox(s) && !nearCtrlHoldBox((double)s.xAbs)
+                && !(g_airPress && (!g_airPressNear || landingNear(s)))
                 && !nearHoldTap((double)s.xAbs)   // --holdtap (object.hpp)
                 && !(edgeLocked && s.action == 1))
                 return;
@@ -1354,6 +1438,13 @@ inline int searchLayers(E& e, const Rules& rules, SearchResult& out) {
             // ---- --coins: collect, then kill whoever left one behind (rules.afterStep) ----
             model.fireGates(kid.s, s.action, input, K, gframe, t, dead);
             rules.afterStep(s, kid, input, K, gframe, t, dead);
+            // --needsize: a state that is not the size the wall needs is dropped on the tick named
+            if (!dead && t == g_needSizeT && (int)kid.s.mini != g_needSizeMini)
+                DIE_AS(kDeathRule, "size/required", nullptr);
+            // --needspeed: a state that crosses the wall's x at a speed the rule does not allow is dropped on the tick it does
+            if (!dead && g_needSpeedX >= 0.0 && (double)s.xAbs < g_needSpeedX && (double)kid.s.xAbs >= g_needSpeedX
+                && ((int)speedCodeForDx((double)kid.s.dx) == g_needSpeedCode) == g_needSpeedNot)
+                DIE_AS(kDeathRule, "speed/required", nullptr);
             // Route tightness rides along with the child (State c = s copies it
             // already, so this only adds this tick's own contribution). Read by
             // the goal pick below; nothing else looks at it.
@@ -1361,6 +1452,20 @@ inline int searchLayers(E& e, const Rules& rules, SearchResult& out) {
                 && tightHere(near, (double)kid.s.xAbs, (double)kid.s.y,
                              playerHalf(kid.s.mode, kid.s.mini != 0), kTightPx))
                 ++kid.s.tight;
+            // --wavetidy / --wavetoggle: a wave's tick is charged for how far it sits from the middle of its corridor,
+            // and a change of the button for itself (thread_pool.hpp); saturating, never wrapping.
+            if (!dead && (g_waveTidy > 0.0 || g_waveToggle > 0) && kid.s.mode == 4 && kid.s.frame == 0) {
+                int add = 0;
+                if (g_waveTidy > 0.0) {
+                    const double half = playerHalf(kid.s.mode, kid.s.mini != 0);
+                    const double off = waveOffCentre(near, (double)kid.s.xAbs, (double)kid.s.y, half,
+                                                     (double)kid.s.bandFloor, (double)kid.s.bandCeil,
+                                                     kid.s.mini ? kWaveClampMini : kWaveClamp);
+                    add += (int)(g_waveTidy * off * off);
+                }
+                if (g_waveToggle > 0 && (int)s.action != input) add += g_waveToggle;
+                kid.s.tight = (uint16_t)std::min(0xffff, (int)kid.s.tight + add);
+            }
             kid.dead = dead ? 1 : 0;
             kid.valid = 1;
             // the dedupe key is a pure function of the child, so it belongs on
@@ -1429,12 +1534,13 @@ inline int searchLayers(E& e, const Rules& rules, SearchResult& out) {
                 auto pressedFrom = [&](const Child& rel) {
                     Child k = rel;
                     k.s.action = 1;
-                    if (g_minPulse > 1)
+                    if (g_minPulse > 1 || g_wavePulse > 1)   // --wavepulse reads edgeAge too
                         k.s.edgeAge = (p.action != 1)
                                           ? 0 : (uint8_t)std::min(254, (int)p.edgeAge + 1);
                     if (g_heldAll) {
                         k.s.held = 1;
                         k.s.jumpBuf = 1;
+                        if (g_dualJumpBuf && k.s.dual) k.s.jumpBuf2 = 1;   // --dualjumpbuf
                         k.key = modelKeyOf(k.s, (long long)t) ^ rules.keyBits(k.s);
                     }
                     return k;
@@ -1985,6 +2091,7 @@ inline int searchLayers(E& e, const Rules& rules, SearchResult& out) {
                                 || std::memcmp(a.usedOrbHist2, b.usedOrbHist2, sizeof(a.usedOrbHist2)) != 0)
                                 diff += " usedOrb";
                             a.jumpBuf = b.jumpBuf;
+                            a.jumpBuf2 = b.jumpBuf2;   // --dualjumpbuf
                             a.usedOrb = b.usedOrb; a.usedOrb2 = b.usedOrb2;
                             a.usedOrbOld = b.usedOrbOld; a.usedOrbOld2 = b.usedOrbOld2;
                             std::memcpy(a.usedOrbHist, b.usedOrbHist, sizeof(a.usedOrbHist));
@@ -2319,6 +2426,13 @@ inline int searchLayers(E& e, const Rules& rules, SearchResult& out) {
         if (qfHere)
             std::printf("qfold: t=%lld frontier=%zu kept=%zu lostq=%lld keys=%lld\n",
                         (long long)t, qfPre, nxt.size(), qfLost, qfKeys);
+        // --wavetidy / --wavetoggle: the next layer is stepped tidiest route first, so the first-accepted-wins dedupe
+        // of its children keeps the tidier route into a cell. Stable: equal scores keep the order they had.
+        // Only in a layer that has a wave in it: elsewhere the order is the one it was, and so is the cap's stride.
+        if ((g_waveTidy > 0.0 || g_waveToggle > 0)
+            && std::any_of(nxt.begin(), nxt.end(), [](const State& s) { return s.mode == 4; }))
+            std::stable_sort(nxt.begin(), nxt.end(),
+                             [](const State& a, const State& b) { return a.tight < b.tight; });
         prevAlive = cur.size();
         cur.swap(nxt);
         nBornPrev = nBorn;
@@ -2449,7 +2563,11 @@ inline int searchLayers(E& e, const Rules& rules, SearchResult& out) {
                 S.census = census;
                 S.twin = twin;
                 S.workStates = g_outcome.workStates - lpWork0;
-                S.autoTrig = g_autoTrig;
+                S.autoFire.resize(g_autoTrig.size());
+                for (size_t i = 0; i < g_autoTrig.size(); ++i) {
+                    const AutoTrig& A = g_autoTrig[i];
+                    S.autoFire[i] = {A.fireT, A.fireX, A.fireSpreadT, A.lockLastX};
+                }
                 S.rotTrig = g_rotTrig;
                 S.carry.assign(4, {});
                 S.carryOn.assign(4, 0);
@@ -2469,6 +2587,25 @@ inline int searchLayers(E& e, const Rules& rules, SearchResult& out) {
                 if (refsOk) {   // a pointer outside the level's lists: this layer is not saved
                     if (g_lpc.snaps.size() >= g_ladderPrefixMaxSnaps) g_lpc.snaps.erase(g_lpc.snaps.begin());
                     g_lpc.snaps.push_back(std::move(S));
+                    // The byte cap: the oldest saves go first, the newest one stays. Only a save that has grown past
+                    // anything the levels measured reaches this; it says so once per ladder.
+                    const size_t capBytes = g_lpc.maxMiB * (size_t)1048576;
+                    size_t held = 0;
+                    for (const LadderPrefixSnap& q : g_lpc.snaps) held += q.bytes();
+                    if (held > capBytes && g_lpc.snaps.size() > 1) {
+                        size_t dropped = 0;
+                        while (held > capBytes && g_lpc.snaps.size() > 1) {
+                            held -= g_lpc.snaps.front().bytes();
+                            g_lpc.snaps.erase(g_lpc.snaps.begin());
+                            ++dropped;
+                        }
+                        if (!g_lpc.capSaid) {
+                            g_lpc.capSaid = true;
+                            std::printf("ladderprefix: the saves passed %zu MiB at t=%lld - the %zu oldest dropped "
+                                        "(%zu kept, %zu MiB)\n",
+                                        g_lpc.maxMiB, t, dropped, g_lpc.snaps.size(), held >> 20);
+                        }
+                    }
                 }
             }
         }
@@ -2518,7 +2655,7 @@ inline int searchLayers(E& e, const Rules& rules, SearchResult& out) {
             p.t0 = t0;
             p.tick = t0 + (long long)plvl.size();
             for (const PlanEdge& e :
-                 planEdges(plvl, pmode, t0, (int)init.held, init.mode))
+                 planEdges(plvl, pmode, t0, planPrevHeld(init), init.mode))
                 p.edges.emplace_back(e.press, e.level);
             g_check.publish(std::move(p));
         }
@@ -3029,11 +3166,11 @@ inline int searchMontecarlo(E& e, const Rules& rules, SearchResult& out) {
     // the plan is then cut back to t0 + horizon -- a prefix KNOWN to stay alive that much longer.
     const long long hzEnd = horizon > 0 ? t0 + horizon * 2 : -1;
     // (...nor a world with item gates, which its walks never fire: Model::fireGates.)
-    if (!g_rotTrig.empty() || !g_ctrlWin.empty() || (g_ctrlWinP2 && !g_ctrlWin2.empty())
+    if (!g_rotTrig.empty() || !g_ctrlWin.empty() || (!g_ctrlWin2.empty())
         || init.frame != 0 || rules.needsAfterStep() || model.hasGates()) {
         std::printf("search: montecarlo declines (rotation=%zu control-windows=%zu frame=%d "
                     "coins=%d%s)\n", g_rotTrig.size(),
-                    g_ctrlWin.size() + (g_ctrlWinP2 ? g_ctrlWin2.size() : 0), (int)init.frame,
+                    g_ctrlWin.size() + (g_ctrlWin2.size()), (int)init.frame,
                     rules.needsAfterStep() ? 1 : 0,
                     model.hasGates() && !rules.needsAfterStep() ? " gates=1" : "");
         out.kind = SearchResult::Declined;

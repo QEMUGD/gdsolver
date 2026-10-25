@@ -205,7 +205,24 @@ to one of those checkpoints is flown from it instead of from tick 0. What the lo
 records per attempt (the anchor rows, the random seeds, the coin state, the
 moving-geometry recording) is taken over from that attempt up to that tick. A clear
 from a checkpoint is not filed: the plan is flown once more from tick 0, and that
-flight's clear is.
+flight's clear is. The game leaves some state of one attempt to the next, so a
+checkpoint is used only when the attempt that took it inherited the same flight band
+and rect latches as the attempt about to fly (cfg `cpcarryparts`); what else an
+attempt inherits was measured not to change a flight. The restore also puts back
+what the game's own checkpoint does not save: broken blocks, the players' follow
+history and the rotation of rotated objects (cfgs `cpdisabled`, `cpfollowfloats`,
+`cprotnode`). A level that keeps items across attempts flies from tick 0
+(`cppersistguard`).
+
+One more saves flights rather than solves. **The model re-anchor** (cfg
+`dpmodelreanchor`, 3 by default): a plan whose own walk through the model already
+dies is not flown as it is. The loop replays it through the solver from the same
+anchor, has the model write its whole state a few ticks before that death (dp
+`--dumpstate`), and searches again from that state (`--start-state`), the same
+ladder of depths the game's anchors use, up to three times per repair. The file
+carries what an anchor taken from the game's recording cannot: the rings and pads
+already used, every trigger's fire state, the moving geometry's last placement. A
+replay from it continues the uninterrupted replay bit for bit.
 
 Every run is *cold*: no seeds, no previous solutions, no external inputs. The
 fixups of a run live only in that run.
@@ -284,8 +301,8 @@ solver's command line:
 | area | on by default | turned off by |
 |---|---|---|
 | the model's rules (`leveldp`) | every measured ramp, dual, portal and kill rule. The 0.4.0 clean-up removed 276 switches, so the rules older than it mostly have no off arm (a few keep one); every rule added since keeps a `--no-` spelling | the older ones: `--no-portalpress`, `--no-portalunpin`, `--no-hazendpoint`, `--no-upsidecoyote`, `--no-padtable`, `--no-airpress`, `--no-anchorride`, `--no-rotsplit`, `--no-obb-all`; the newer: `--no-<flag>`, e.g. `--no-gravtrig`, `--no-teleporttrig`, `--no-portreread`, `--no-flipbonk` |
-| the search (`leveldp`) | `--ladderovercap`, `--ladderprefix`, `--rejoinprobe 5`, `--resimladder` (a plan whose own walk dies is searched again from a few ticks before that death) | `--no-ladderovercap`, `--no-ladderprefix`, `--no-rejoinprobe`, `--no-resimladder` |
-| the repair loop | `cpflight=600`, `dplearnresets=1`, `dpfineretry`, `dpxtrack`, `dpanchorrotstep`, `dpanchorrot2`, `portalpayloadlt`, `offboardtp`, `offboardfree`, `offboardband`, `voidband`, `singlereset`, `headbandfresh`, `anchorboardarm`, `cpfollowsection`, `dpseedpickups`, `snapnodesync`, `obbnolatch` | `cpflight=0`, `dplearnresets=-1`, the others `=0` |
+| the search (`leveldp`) | `--ladderovercap`, `--ladderprefix`, `--rejoinprobe 5` | `--no-ladderovercap`, `--no-ladderprefix`, `--rejoinprobe 0` |
+| the repair loop | `cpflight=600`, `cpcarryparts=3`, `dplearnresets=1`, `dpmodelreanchor=3`, `offboardfree`, `offboardband`, `voidband`, `cpfollowsection`, `cpdisabled`, `cpfollowfloats`, `cprotnode`, `cppersistguard`, `dpseedpickups`, `snapnodesync`, `obbnolatch` | `cpflight=0`, `cpcarryparts=31`, `dplearnresets=-1`, the others `=0` |
 | coins ([COINS.md](COINS.md)) | `dpcoinwin=60,2,700`, `coinapproachreach`, `coinmissearly`, `routeprereq` | `=0` |
 | the section solver ([SECTION_SOLVE.md](SECTION_SOLVE.md)) | `dpsectierfirst`, `dpsecstate`, `dpsecrecaway`, `secsnapem`, `secjbkeep`, `secheaddash`, `secheadaccel`, `secgracedash`, `secrungcoinoff`, `secbookfirst`, `secredoreach`, `secwsnapauto`, `secwsnapgate`, `sectionhooklazy` | `=0` |
 | the level slice ([LEVEL_SLICE.md](LEVEL_SLICE.md)) | `slicetriggers`, `sliceuids`, `slicekeepgroups`, `slicenotouch`, `slicefirstref`, `slicegiveupcopy` | `=0` |

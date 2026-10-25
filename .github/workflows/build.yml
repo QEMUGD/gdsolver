@@ -1,8 +1,13 @@
-# Windows, and Android as an experiment (docs/ANDROID.md). The Android job may fail while the
-# port is under way and never decides the run; only the Windows package is attached to a release,
-# and only to a full one: the Android build is published by hand as a separate pre-release, and a
+# The Windows package for Geometry Dash 2.209, built by scripts/ci-build-2209.ps1; Android is a manual run only (docs/ANDROID.md). Only the
+# Windows package is attached to a release, and only to a full one: the Android build is published by hand as a separate pre-release, and a
 # pre-release gets no Windows package (it would sit beside, or overwrite, the Android one).
 # The other platforms in Geode's example workflow cannot build this.
+#
+# Why the Windows job does not use geode-sdk/build-geode-mod: the mod is made for a 2.209 executable. That needs the bindings of a fork of
+# geode-sdk/bindings that carries bindings/2.209 (repository variables GDSOLVER_BINDINGS_REPO and GDSOLVER_BINDINGS_REF name the fork and the
+# ref to build against) and the Geode SDK with the header changes in tools/geode-sdk-2209.patch. The script clones the SDK at the pinned
+# commit, applies the patch, installs the SDK's binaries, clones the fork and builds with what build-geode-mod passes on Windows (Ninja,
+# clang, Release, LTO). The same script runs on a desk (see its header), so the job is nothing a person cannot reproduce.
 #
 # The point of building here rather than locally is that the binary attached to a release can be
 # traced to a commit of the public tree. The pitfalls page asks for it for that reason ("makes it
@@ -27,28 +32,40 @@ permissions:
 
 jobs:
   windows:
-    name: Windows
+    name: Windows (GD 2.209)
     runs-on: windows-latest
 
     steps:
       - uses: actions/checkout@v7
 
-      # `sdk: given` (the default) takes the Geode version out of mod.json, so CI and a desk
-      # build are the same SDK without a second place to keep it up to date.
-      # The bindings are pinned to the commit the desk builds use: the action otherwise takes the
-      # bindings repo's latest main, and a change there on 2026-10-06 made GJGameState's copy
-      # assignment implicitly deleted, which src/solver/psnap.hpp relies on.
-      - name: Build the mod
+      - name: Install the Geode CLI
+        uses: geode-sdk/cli/.github/actions/setup@main
+
+      # The CLI wants a profile before it installs SDK binaries; a file standing in for the game is enough (what build-geode-mod does).
+      - name: Set up a Geode profile
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'gd'
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          New-Item -ItemType File -Force (Join-Path $dir 'GeometryDash.exe') | Out-Null
+          geode profile add --name GithubActions (Join-Path $dir 'GeometryDash.exe') win
+
+      - name: Install Ninja
+        run: python -m pip install ninja
+
+      - name: Build the package
         id: build
-        uses: geode-sdk/build-geode-mod@main
-        with:
-          bindings-ref: f050fd74ad531b0827377c97510cb807903ff1b3
+        shell: pwsh
+        env:
+          GDSOLVER_BINDINGS_REPO: ${{ vars.GDSOLVER_BINDINGS_REPO }}
+          GDSOLVER_BINDINGS_REF: ${{ vars.GDSOLVER_BINDINGS_REF }}
+        run: ./scripts/ci-build-2209.ps1 -Work "$env:RUNNER_TEMP/ci-work" -Out "$env:GITHUB_WORKSPACE/output"
 
       - name: Upload the package
         uses: actions/upload-artifact@v7
         with:
           name: geode-package
-          path: ${{ steps.build.outputs.build-output }}
+          path: output
 
       # The file is named after the mod id, so it is matched rather than spelled out -- the id
       # changed once already and took four hardcoded copies of the old name with it.
@@ -58,11 +75,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release upload "${{ github.event.release.tag_name }}" \
-            "${{ steps.build.outputs.build-output }}"/*.geode --clobber
+          gh release upload "${{ github.event.release.tag_name }}" output/*.geode --clobber
 
+  # Manual only: Android is not part of the release (it is built for 2.2081, the version mod.json's gd.android names, and published by hand).
   android:
-    name: Android64 (experimental)
+    name: Android64 (experimental, manual)
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     continue-on-error: true
 

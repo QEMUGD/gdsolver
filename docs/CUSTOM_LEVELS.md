@@ -52,7 +52,26 @@ side rather than to the solver; it stays in the hundred as a level that did not
 clear. The 20 minutes are the measurement's time box, not a verdict: the
 levels that ran out of time were still making progress, and the runs share one
 machine, several levels at a time, so a level close to the limit can land on
-either side of it.
+either side of it. The hundred was not measured again for v0.6.0.
+
+### The Daily, Weekly and Event levels
+
+For v0.6.0 a second survey took the levels the game itself features: 50 drawn at
+random from the last 365 Daily levels, the last 50 Weekly levels (about a year of
+them; Weekly levels are demons), and every Event level in the game's Safe list. Each was
+solved cold at the release defaults and given up to 20 minutes, on GD 2.2081
+with a build from just before the release (before the rules turned on by default
+and the switches removed in v0.6.0). **74 of the 126 cleared.**
+
+| list | levels | cleared | ran out of time | stopped | median time to clear |
+|---|--:|--:|--:|--:|--:|
+| Daily | 50 | 41 | 9 | 0 | 159 s |
+| Weekly | 50 | 23 | 27 | 0 | 492 s |
+| Event | 26 | 10 | 15 | 1 | 290 s |
+| all | 126 | 74 | 51 | 1 | |
+
+These lists are chosen by the game's developer, and the Weekly ones are demons,
+so the two surveys draw from different pools and their rates are not comparable.
 
 The version a level was saved in is only a guess at what it uses: a level saved in
 2.1 may hold nothing newer than 1.8. On the v0.4.0 build the survey also took 200
@@ -79,7 +98,11 @@ levels with newer objects the wave is the outlier, and the swing has barely been
 measured at all.
 
 *When and with what:* the hundred, 2026-10-11 on the v0.5.0 build and 2026-10-02
-on v0.4.0; the 200 older levels and the rates per mode, 2026-10-02 on v0.4.0.
+on v0.4.0; the 200 older levels and the rates per mode, 2026-10-02 on v0.4.0; the
+Daily, Weekly and Event levels, 2026-10-16 and 10-17 on GD 2.2081. Four of them
+were run again on 10-17, on builds with the same defaults, after their first run was
+cut short (one never started, one was left by hand, one was stopped for memory, one
+was stopped early by the test harness).
 
 ## Levels that usually solve
 
@@ -113,13 +136,19 @@ section solver finds a way through the game itself — slowly, and not always.
 
 * **Some teleports.** The teleport portal, the teleport trigger and the teleport
   orb are modelled, as are a portal that pushes the player or keeps their height,
-  and an exit right above or below. Not yet: an exit elsewhere in x (the model
-  keeps x as its clock, so that is a jump it cannot take), an orb that pushes the
-  player, an exit the game draws from several objects, and a teleport trigger set
-  off by touch or a spawn, or one that keeps the player's offset.
+  an exit anywhere in x — ahead, above or below, or behind, where the triggers
+  already passed do not fire again, as in the game — and a teleport trigger set
+  off by touch, by a spawn the player's crossing or touch starts, or by an Event
+  trigger listening for the player's pads and orbs. Not yet: an orb that pushes
+  the player, an exit the game draws from several objects, a teleport trigger that
+  keeps the player's offset, and one set off by an item, a delayed spawn or any
+  other event.
 * **Some gravity triggers.** The gravity trigger (2.2) is modelled when the player
-  crossing it sets it off; one set off by touch or a spawn, or one for player 2,
-  is flown by the game with the new gravity and planned by the model with the old.
+  sets it off by crossing or touching it, by starting the spawn that fires it, or
+  through an Event trigger listening for the player's pads and orbs; one for
+  player 2 in a level with a second player, or one set off by an item, a delayed
+  spawn or any other event, is flown by the game with the new gravity and planned
+  by the model with the old.
 * **Some Follow Player Y triggers**: one with a delay, one set off by touch or a
   spawn, or more of them running at once than the model's state holds.
 * **Two-player levels.** The second player has a button of its own, which the bot
@@ -132,7 +161,10 @@ section solver finds a way through the game itself — slowly, and not always.
   settings, off by default, pin what such a level reads, so that every attempt
   meets the same level: `attemptone` (every bot attempt is the level's first),
   `attemptcount=k`, and `persistworld=k` / `persistitems` (every reset starts from
-  one fixed table of kept items).
+  one fixed table of kept items). Many levels count attempts only to show
+  something — the attempt number on a label, a message on the first try — and
+  the play menu warns about a level only when what changes reaches something
+  the player touches or the player itself.
 * **Randomness.** While the bot drives, the game's random seeds are set to the same
   values before every attempt, so each attempt meets the same draw — an Area Move's
   distance, a Random trigger's choice — and the model plans against the positions

@@ -729,9 +729,6 @@ void warpFlyShipStep() {
 // another object's rows begin at t=0 (a recording-wide minimum would have called B's start known). Object C is B
 // with one earlier row at another velocity: the change dates it, so it is extended (2 steps, cap 48).
 void moverExtendStart() {
-    const bool savedMe = dp::g_moverExtend, savedMv = dp::g_moverExtendVel;
-    dp::g_moverExtend = true;
-    dp::g_moverExtendVel = false;
     dp::Dynamics d;
     d.objs.resize(3);
     d.samples.assign(3, {});
@@ -748,8 +745,6 @@ void moverExtendStart() {
     check(d.extOk[0] == 1 && d.extCap[0] == 38, "--moverextend: stood still, then moved: start dated by the gap -> extended (cap 38)");
     check(d.extOk[1] == 0, "--moverextend: first recorded mid-Move at t=100 while another object has rows from t=0 -> not extended");
     check(d.extOk[2] == 1 && d.extCap[2] == 48, "--moverextend: a velocity change dates the start -> extended (cap 48)");
-    dp::g_moverExtend = savedMe;
-    dp::g_moverExtendVel = savedMv;
 }
 // --slambox: the toward-the-player steps an object takes from the boxes the state touched,
 // each part decided the way dynamics.hpp's slam loop decides it -- skipped iff slamBoxRecorded says the

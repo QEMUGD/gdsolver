@@ -48,6 +48,12 @@ inline bool g_twinAudit = false;
 // left with no child by the rule.
 inline int g_minPulse = 0;
 inline int g_inputGrid = 0;
+//   --wavepulse K  --minpulse for the WAVE only (State::mode 4 at the tick the button would change): a wave
+//                  that has just pressed or let go keeps that level for at least K ticks. The user's
+//                  wave-behaviour option (Avoid glitches, third choice): a hand cannot toggle every 1-3
+//                  ticks, which is what the search plans when nothing asks it not to. Off at 0/1; a
+//                  search restriction like --minpulse, not physics.
+inline int g_wavePulse = 0;
 // --gridmap x0:k0,x1:k1,...: the input grid as a step function of the frontier's leading x (the
 // previous layer's, as --capmap reads it). From x_i on the grid is k_i, where 0 means
 // --inputgrid's value and 1 means none; before the first entry it is --inputgrid. Empty =

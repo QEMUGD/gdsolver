@@ -104,7 +104,7 @@ struct State {
     float xAbs;       // absolute x, float-accumulated like GD (see advanceX)
     const Obj* snapObj;  // GD m_objectSnappedTo: last solid stood on (null = none)
     float snapDist;      // GD m_snapDistance: x - snapObj->cx at the last contact
-    // --p2xoff: the second dual body's x minus the first's (constants.hpp g_p2xOff). A teleport
+    // --p2xoff: the second dual body's x minus the first's. A teleport
     // trigger moves player 1 alone, and the pair then runs apart for the rest of the dual. Written
     // by stepBoth (fixup.hpp) only under the flag, 0 from a dual portal on, read only while dual,
     // seeded at an anchor from --startp2dx. It accumulates. HERE and not at the end: it fills the
@@ -230,6 +230,13 @@ struct State {
     // when not riding. Rewritten on every riding tick, not seeded (an anchor on the tick after a
     // speed change mid-ride is a hole, as for pFlap); a dual's two bodies share it.
     uint8_t seatSpd = 0;
+    // --gravtouch only (0 otherwise): the touch-triggered gravity trigger this branch fired last, as
+    // index + 1 into g_gravTouchBoxes (modifiers.hpp gravModOf). It accumulates; seeded at an anchor from
+    // --startgmod through an entry of its own when GD's value there is not the crossing triggers'.
+    uint8_t gravTouch = 0;
+    // --tptouch only (0 otherwise): the touch-triggered teleport box this branch fired last (index + 1 into
+    // g_tpTouchBoxes), which does not fire again while it is the last. It accumulates and is not seeded.
+    uint8_t tpTouch = 0;
     // Ticks since gravity last flipped, saturated at 24 -- the same 0.1 s at
     // 240 ticks/s as slopeT above, and read the same way: GD stamps the time in
     // flipGravity (player+0x800) and collidedWithObjectInternal (:1180-1226)
@@ -363,6 +370,11 @@ struct State {
     // same way `dx` is, so states with different masks can never merge.
     TouchMask trig{};
     int32_t trigT = -1;
+    // --tpmark: the uids of the last two teleports (747 and its kin) the body fired that have no latch bit, newest first (A, then B).
+    // GD marks a teleport activated for the player for the rest of the attempt (teleportPlayer sets +0x558); a body that leaves the
+    // box and comes back does not fire it again. The two take the 4-byte padding after trigT and after slopeUidNow2, so sizeof is
+    // unchanged; they accumulate and are NOT seeded at an --start anchor (-1: none). -1 whenever the flag is off.
+    int32_t tpMarkA = -1;
     // Which of the level's gravity portals this state has already SPENT. GD
     // latches one on first overlap, not on first firing, so a pass taken at
     // the polarity the portal would set spends it even though flipGravity does
@@ -451,6 +463,9 @@ struct State {
     // checkCollisions (0x21384e), which skips the band block while it is set.
     // One tick of life; not carried by --start; a dual's two bodies share it.
     // (Here because rotChan leaves a byte of padding before rotRev.)
+    // The 1 bit is that byte (a teleport portal). The 2 bit (--tptrigforce): a teleport trigger moved the body at
+    // the end of this tick from a place no force reached, so the next tick has no push (modifiers.hpp). The 4 bit
+    // (--tpjumpnext): a teleport moved x forward this tick, from tpFromX.
     uint8_t tpSkip = 0;
     // Per-channel reverse, one bit per channel. Also not derivable -- lv22's
     // channel 1 is reached both from a 2900 with gnddir=2 (reverse) and from
@@ -523,12 +538,21 @@ struct State {
     // last ceiling-ramp press, which is the mode GD's slope impulse (+0x9b4)
     // was computed for. Not carried by --start; a dual's two bodies share it.
     uint8_t ceilMode = 0;
+    // --tpback only (0 otherwise): the farthest x this branch has reached, when a teleport has since moved it
+    // back, as index + 1 into g_tpBackHi (modifiers.hpp crossX). GD's crossing queue
+    // (checkSpawnObjects 0x21a8f0) only moves forward, so a trigger it has passed does not fire again and
+    // the next one fires once x is past that farthest x. It accumulates; seeded at an anchor from --startxhi.
+    uint8_t tpBack = 0;
     // [2026-08-21 r93] Marks the tick on which a warp interrupted a ride = THE
     // RAMP'S SLOPE-EXIT LAUNCH VALUE TO EMIT ON THE NEXT TICK (0 = none). Same
     // 1-tick lifetime as pFlap, not carried by the anchor. It holds
     // a value because by the next tick the ride's information (slopeT) is
     // already gone.
     float pExitVy = 0.f;
+    // --tpjumpnext only (valid while tpSkip's 4 bit is set): x before the teleport that moved it forward this
+    // tick. The x crossings that jump passed fire on the NEXT tick (modifiers.hpp g_tpJumpNext), so this tick's
+    // crossings end here and the next tick's start here. One tick of life; not carried by --start.
+    float tpFromX = 0.f;
     // [2026-08-19 night 3] THE UID OF THE RAMP THAT STARTED THE CURRENT RIDE.
     // Not rewritten during the ride, so "is the ramp we are on the one we
     // started on, or one we moved onto across a seam" is a uid comparison. The
@@ -550,6 +574,10 @@ struct State {
     // --dualseatt: the second body's law-seat count (see seatT). It accumulates and is not seeded
     // (seatT is not either).
     uint8_t seatT2 = 0;
+    // --sticktie0: this tick's solid pass registered GD's stick fallback (+0x600) -- a support moving down
+    // held the rider -- for the next tick's re-land. One tick of life, so nothing to seed; in the padding
+    // after seatT2, so sizeof is unchanged.
+    uint8_t stickFb = 0;
     float y2, vy2, slopeM2, snapDist2;
     uint8_t grounded2, flip2, ringHold2, onSlope2;
     uint8_t pressSpent2 = 0;   // second body's pressSpent (see pressSpent)
@@ -595,6 +623,7 @@ struct State {
     // mini2: each half rides its own ramp, and the pair's ramps are mirror images that never
     // share a uid.
     int32_t slopeUid02 = -1, slopeUidNow2 = -1;
+    int32_t tpMarkB = -1;   // --tpmark (see tpMarkA)
     const Obj* snapObj2;
     const Obj* usedOrb2;
     const Obj* usedPad2[4];
@@ -1107,6 +1136,10 @@ struct State {
     // anchor starts with (not seeded: the dump has no +0x985). In the padding after ogLinger, so
     // sizeof is unchanged -- the three per-half sites are declaration, swapHalves and fixup.hpp.
     uint8_t holdDead = 0, holdDead2 = 0;
+    // --dualjumpbuf: the second body's jumpBuf (GD's +0x985 is per player). Shared, a ring the first body fired
+    // cleared the second's buffer too. In the padding after holdDead2, so sizeof is unchanged; the per-half sites
+    // are swapHalves, fixup.hpp's merge and the dual's birth (step.hpp). Not seeded at an anchor (jumpBuf is not).
+    uint8_t jumpBuf2 = 0;
     // --ringonce: the rings fired before usedOrbOld, newest first, per body (-1 = empty). GD fires
     // a ring once in a run, and two slots cannot hold a maze: a custom level fires gravity ring uid 378 at
     // t=2,528, then yellows 386 and 385, and on the next press refuses 378 while the model, down to
@@ -1195,6 +1228,13 @@ struct State {
     // --start anchor (the dump has no column for it), so an anchor starts it unknown and the scale
     // falls back to reading the stake's value. 0 whenever the flag is off.
     uint8_t ball728 = 0;
+    // --dashsprite: the dash art's spin (PlayerObject::updateDashArt 0x3961c0 runs a CCRepeatForever of CCRotateBy on
+    // two child sprites at the dash's start and stopDashing 0x396650 hands the first one's angle to the player at
+    // the end -- speed.hpp). dashNeg = the spin's sign, dashF = the scheduler frame (tick >> 2) the dash began in.
+    // They take the padding after ball728, so sizeof is unchanged; they accumulate (a dash is held) and are NOT
+    // seeded at an --start anchor (an anchor inside a dash reads the spin as not begun). 0 whenever the flag is off.
+    uint8_t dashNeg = 0;
+    uint16_t dashF = 0;
     float rot2 = 0.f, rotStep2 = 0.f;
     float dashSlope2 = 0.f;
     // --slopestick: the ramp GD's +0x5e8 holds -- the one the body last landed on -- by uid, -1 when
@@ -1313,8 +1353,15 @@ struct State {
 // [2026-10-10] 536 -> 552: spdMore / spdMore2 (--spdsameonce, the speed portals' memory four deep per
 // body, after stickSlope's padding). They accumulate and are not seeded, for spdFired's reason;
 // printed in --seeddump under the flag.
+// [2026-10-13] gravTouch (--gravtouch) and tpTouch (--tptouch) landed in the padding after seatSpd: still
+// 552. Both accumulate; gravTouch is seeded at an anchor from --startgmod (cli.hpp), tpTouch is not (an
+// anchor past a box's teleport is past the box). Neither is printed in --seeddump.
+// [2026-10-13] tpBack (--tpback) landed in the padding after ceilMode: still 552. It accumulates; seeded at
+// an anchor from --startxhi (cli.hpp), not printed in --seeddump.
+// [2026-10-13] 552 -> 560: tpFromX (--tpjumpnext, x before this tick's forward teleport). One tick of life, so
+// nothing to seed.
 constexpr size_t kStateBytes =
-    (552u +(size_t)(kTouchBits - 32) * sizeof(uint16_t)
+    (560u +(size_t)(kTouchBits - 32) * sizeof(uint16_t)
           + (sizeof(TouchMask) - sizeof(uint32_t))
           + 2u * (sizeof(GravLatch) - sizeof(Bits<128>)) + 7u) / 8u * 8u;
 static_assert(sizeof(State) == kStateBytes,

@@ -122,7 +122,7 @@ inline bool inGroup(const GroupKey& k, const State& s, float fallbackDx) {
 // orbs, pads and ramps around ITS x, so the windows of its tick are stretched over that body too.
 // p2Dx is 0 without the flag and for every pair that never separated, so those windows are as
 // before.
-inline float p2Dx(const State& s) { return (g_p2xOff && s.dual && s.frame == 0) ? s.dx2 : 0.f; }
+inline float p2Dx(const State& s) { return (s.dual && s.frame == 0) ? s.dx2 : 0.f; }
 inline void p2Widen(double& wLo, double& wHi, float dLo, float dHi) {
     if (dLo < 0.f) wLo += (double)dLo;
     if (dHi > 0.f) wHi += (double)dHi;
@@ -184,7 +184,7 @@ inline void prepareGroup(ModelWorld& w, FrameSlices& FS, GroupEnv& e, int gframe
     // seek() mutates the rects in place, so the pointers the search already
     // holds (snapObj / usedOrb / usedPad) keep pointing at the same object.
     Level& LG = *FS.lv;
-    LG.dyn.seek((int)t);
+    LG.dyn.seek((int)t, true);   // (applyTriggers follows below: see Dynamics::seek)
     seekOtherFrames(&LG, (int)t);   // --rotpretap only; serial here, before the workers
     // ...and then the doors this group has (or has not) opened. Must come
     // after seek and before any window is built. `gFire` is the LATEST
@@ -231,15 +231,14 @@ inline void prepareGroup(ModelWorld& w, FrameSlices& FS, GroupEnv& e, int gframe
     FS.port->forRange(wLo - 60, wHi + 60, [&](const Obj& o) { e.ports.push_back(&o); });
     LG.dyn.collect(Dynamics::PORT, wLo - 60, wHi + 60, e.ports);
     // --portorder (constants.hpp): the collision pass's order, cell by cell and by uid in a cell
-    if (g_portOrder)
-        std::stable_sort(e.ports.begin(), e.ports.end(), [](const Obj* a, const Obj* b) {
-            const int ax = gdSectionCell(a->cx), bx = gdSectionCell(b->cx);
-            if (ax != bx) return ax < bx;
-            const int ay = g_dynamicLevelHeight ? gdSectionCell(a->cy) : 0;
-            const int by = g_dynamicLevelHeight ? gdSectionCell(b->cy) : 0;
-            if (ay != by) return ay < by;
-            return a->uid < b->uid;
-        });
+    std::stable_sort(e.ports.begin(), e.ports.end(), [](const Obj* a, const Obj* b) {
+        const int ax = gdSectionCell(a->cx), bx = gdSectionCell(b->cx);
+        if (ax != bx) return ax < bx;
+        const int ay = g_dynamicLevelHeight ? gdSectionCell(a->cy) : 0;
+        const int by = g_dynamicLevelHeight ? gdSectionCell(b->cy) : 0;
+        if (ay != by) return ay < by;
+        return a->uid < b->uid;
+    });
     FS.pad->forRange(wLo - 40, wHi + 40, [&](const Obj& o) { e.pads.push_back(&o); });
     LG.dyn.collect(Dynamics::PAD, wLo - 40, wHi + 40, e.pads);
     FS.orb->forRange(wLo - 50, wHi + 50, [&](const Obj& o) { e.orbs.push_back(&o); });
@@ -354,7 +353,7 @@ inline void prepareGroup(ModelWorld& w, FrameSlices& FS, GroupEnv& e, int gframe
     // tick's x), and where its group's objects sit in the windows -- the step puts each one at
     // its own state's height (step.hpp, the top of stepOne).
     e.fol.clear();
-    const bool folOn = g_followYOn && (!g_followYs.empty() || !g_followSecObjs.empty());
+    const bool folOn = !g_followYs.empty() || !g_followSecObjs.empty();
     if (folOn || !g_bigSecObjs.empty() || !g_bigSecDyn.empty()) {
         if (folOn)
             for (FollowY& f : g_followYs)
@@ -421,7 +420,8 @@ inline State advanceState(const State& s, int input, const StepCtx& K, bool& dea
                         && K.t <= g_rotWatchHi;
         if (rw) g_rotWatchUid = -1;
         const int f0R = (int)c.frame;
-        const int nfR = applyRotation(c, (double)s.xAbs, (double)K.dxF, K.t,
+        // --tpjumpnext: the crossing starts where last tick's forward jump left (step.hpp crossBaseX)
+        const int nfR = applyRotation(c, crossBaseX(s), (double)K.dxF, K.t,
                                       input, s.grounded != 0, (double)s.y, true);
         if (rw && nfR >= 0) {   // --rotwatch: print only, read in the serial pass
             rot->set = true;
@@ -544,13 +544,12 @@ inline void fireAutoTriggers(const std::vector<State>& frontier, long long t) {
         A.fireX = A.lockLastX = xLead;
         // --autoown: the most ticks a state still behind it needs to reach it at its own speed (dynamics.hpp).
         A.fireSpreadT = 0;
-        if (g_autoOwn)
-            for (const State& s : frontier) {
-                if ((int)s.frame != 0 || s.rev) continue;
-                const double sx = progressOf(s).x;
-                if (sx < A.cx && s.dx > 0.f)
-                    A.fireSpreadT = std::max(A.fireSpreadT, (int)std::ceil((A.cx - sx) / (double)s.dx) + 1);
-            }
+        for (const State& s : frontier) {
+            if ((int)s.frame != 0 || s.rev) continue;
+            const double sx = progressOf(s).x;
+            if (sx < A.cx && s.dx > 0.f)
+                A.fireSpreadT = std::max(A.fireSpreadT, (int)std::ceil((A.cx - sx) / (double)s.dx) + 1);
+        }
         std::printf("autotrig: uid %d x=%.0f crossed at t=%lld, "
                     "effect t=%d\n",
                     A.uid, A.cx, t - 1, A.fireT);
@@ -569,7 +568,9 @@ inline void fireAutoTriggers(const std::vector<State>& frontier, long long t) {
 // May the button change on tick t (--minpulse: not within g_minPulse ticks of the last change;
 // --inputgrid / --gridmap: only on the search's grid, `gridNow`, 1 or less when off)?
 inline bool edgeLocked(const State& s, int gridNow, long long t) {
-    return (g_minPulse > 1 && (int)s.edgeAge + 1 < g_minPulse) || (gridNow > 1 && (t % gridNow) != 0);
+    return (g_minPulse > 1 && (int)s.edgeAge + 1 < g_minPulse)
+           || (g_wavePulse > 1 && s.mode == 4 && (int)s.edgeAge + 1 < g_wavePulse)   // --wavepulse
+           || (gridNow > 1 && (t % gridNow) != 0);
 }
 // May `s` take `input` on tick t? Not a change the button cannot make (edgeLocked), and not an edge
 // on a tick GD cannot put one (--latgap, frames.hpp g_latGap: s.latLock). A search that steps an
@@ -584,7 +585,7 @@ inline bool inputAllowed(const State& s, int input, int gridNow, long long t) {
 // lock (a mode with latency 2 entered from one without).
 inline void noteInput(const State& prev, State& c, int input) {
     c.action = (uint8_t)input;
-    if (g_minPulse > 1)
+    if (g_minPulse > 1 || g_wavePulse > 1)
         c.edgeAge = (input != (int)prev.action) ? 0 : (uint8_t)std::min(254, (int)prev.edgeAge + 1);
     const auto lat2 = [](uint8_t m) { return m == 1 || m == 3; };
     c.latLock = (lat2(c.mode) && !lat2(prev.mode) && !c.dual) ? 1 : 0;

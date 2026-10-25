@@ -19,15 +19,6 @@ inline double topAheadAt(double x) {
     if (i >= (long long)g_topAhead.size()) return -1e9;
     return g_topAhead[(size_t)i];
 }
-// --escdyn (default on since 2026-10): the same suffix maximum over the MOVING objects (L.dyn), which g_topAhead
-// leaves out -- it is built from L.objs / pads / orbs / portals only. Each object counts with the
-// highest top it has anywhere in the recording, or its placed top plus every upward move its
-// controllers can add, whichever is higher, at the leftmost x it is recorded at: "can it ever be
-// above the body", not "where is it now", because the prune asks whether the body can EVER come
-// down. A custom level's flipped ball (t=8,634, x=13,533, y-pH 225, static topAhead 210) was pruned
-// while GD's ball landed on the underside of a descending block group (bottom ~277) ten ticks
-// later and lived 349 more ticks. Frame 0 only; empty without the flag.
-inline bool g_escDyn = true;
 inline std::vector<double> g_topAheadDyn;   // per 30 px bucket, on g_topAhead's grid
 inline double topAheadDynAt(double x) {
     if (g_topAheadDyn.empty()) return -1e18;
@@ -76,14 +67,6 @@ inline double g_cubeVq = 10.0;
 // Dedupe multiplier for a dual's second body while it is in open air (see
 // stepBoth / keyOf). 0.125 = 4 px / 0.8 vy bins instead of 0.5 px / 0.1.
 inline double g_dualFreeQ = 0.125;
-// --heldkeyread (default on since 2026-10): key `held` only for a body whose next tick reads it or writes it from the
-// button -- ship, UFO, wave and swing (and every dual) -- instead of in every mode. Only the wave
-// and flight branches write `held` (without --heldall), so in a cube, ball, robot or spider it
-// is whatever the last flight section left, read by nothing, and it split those cells: measured
-// by --searchcensus over the 22 official levels and 7 customs, 15% of cube cells, 21% of ball
-// and 6% of spider cells were kept apart by `held` alone.
-inline constexpr bool kDefHeldKeyRead = true;
-inline bool g_heldKeyRead = kDefHeldKeyRead;
 // --keyxq / --keyxqfly (default 4.0 = the 0.25 px x bucket): the x-phase bucket multiplier for
 // the ground modes (cube, ball, robot, spider) and for the flying ones (ship, UFO, wave, swing).
 // The x term keeps the snap phases apart (see keyOf); --searchcensus measured it as the largest
@@ -508,8 +491,13 @@ inline uint64_t modelKeyOf(const State& s, long long t) {
            ^ (s.ceilT ? (0x165667B19E3779F9ull
                          * (uint64_t)(s.ceilT | ((uint32_t)s.ceilM4 << 8)))
                       : 0)
-           // --heldkeyread: only where the body's next tick reads or writes it (see above)
-           ^ ((!g_heldKeyRead || s.dual || s.mode == 1 || s.mode == 3 || s.mode == 4
+           // `held` is keyed only for a body whose next tick reads it or writes it from the button -- ship, UFO,
+           // wave and swing (and every dual) -- not in every mode (formerly --heldkeyread). Only the wave and
+           // flight branches write `held` (without --heldall), so in a cube, ball, robot or spider it is
+           // whatever the last flight section left, read by nothing, and it split those cells: measured by
+           // --searchcensus over the 22 official levels and 7 customs, 15% of cube cells, 21% of ball and 6% of
+           // spider cells were kept apart by `held` alone.
+           ^ ((s.dual || s.mode == 1 || s.mode == 3 || s.mode == 4
                || s.mode == 7)
                   ? ((uint64_t)s.held << 1) : 0)
            ^ s.grounded;
@@ -586,6 +574,12 @@ inline uint64_t modelKeyOf(const State& s, long long t) {
     // switches off the button is part of the state (nearCtrlHoldBox). 0 keeps every key as it was.
     if (s.ctrlT) k ^= 0x2545F4914F6CDD1Dull;
     if (s.action && nearCtrlHoldBox((double)s.xAbs)) k ^= 0x9FB21C651E98DF25ull;
+    // --gravtouch: a branch that fired a touch-triggered gravity trigger falls at another rate (State::gravTouch)
+    if (s.gravTouch) k ^= (uint64_t)s.gravTouch * 0xD6E8FEB86659FD93ull;
+    // --tptouch: ...and one whose last touched teleport box will not fire again (State::tpTouch)
+    if (s.tpTouch) k ^= (uint64_t)s.tpTouch * 0x94D049BB133111EBull;
+    // --tpback: ...and one a teleport has left behind its farthest x, whose crossings wait for it (State::tpBack)
+    if (s.tpBack) k ^= (uint64_t)s.tpBack * 0xC2B2AE3D27D4EB4Full;
     return k;
 }
 inline uint64_t keyOf(const State& s, long long t) { return modelKeyOf(s, t) ^ coinKeyBits(s); }

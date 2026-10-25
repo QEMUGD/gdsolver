@@ -351,8 +351,10 @@ inline State stepBoth(const State& s, int input, const StepCtx& K, bool& dead) {
     bool p1FlippedGravity = false;
     if (g_touchCensus) g_tcBranch = 0;
     g_preBtnSet = false;
+    t_spiderFreshWarp = false;   // --spidertptouch
     t_ringLinkLate = 0;   // --ringtaplink
     State c = stepOne(s, input, K, d1, &p1FlippedGravity);
+    const bool p1FreshWarp = t_spiderFreshWarp;   // p1's, before p2's stepOne can overwrite it
     const bool p1RingLate = t_ringLinkLate != 0;
     t_ringLinkLate = 0;
     if (g_touchCensus) g_tcBranchP1 = g_tcBranch;
@@ -434,7 +436,7 @@ inline State stepBoth(const State& s, int input, const StepCtx& K, bool& dead) {
             sb.flip = want;
             sb.vy = (float)((double)sb.vy * 0.5);
             // --ballscaleair: the partner call is a flipGravity, which lowers a ball's +0x728
-            if (g_ballScaleAir && sb.mode == 2) sb.ball728 = (uint8_t)((sb.ball728 & ~3u) | 1u);
+            if (sb.mode == 2) sb.ball728 = (uint8_t)((sb.ball728 & ~3u) | 1u);
         }
     }
     // --ballscaleair: each body's polarity as its own step left it; the partner calls and the repel
@@ -445,8 +447,8 @@ inline State stepBoth(const State& s, int input, const StepCtx& K, bool& dead) {
     g_halfNow = 1;
     // --dualband: the second half's portal band reads p1's finished mode, and says if it wrote
     g_bandPortalWrote = false;
-    if (g_dualBand) g_dualOtherMode = (int)c.mode;
-    g_p2SoloHalf = g_p2Solo;   // --p2solo
+    g_dualOtherMode = (int)c.mode;
+    g_p2SoloHalf = true;   // the second body that has left runs alone (formerly --p2solo)
     g_p2SoloFired = false;
     t_followHalf2 = 1;   // --followy: player 1's y is sb's y2
     t_p2RingFresh = -1;  // --rtlp2ring
@@ -454,7 +456,7 @@ inline State stepBoth(const State& s, int input, const StepCtx& K, bool& dead) {
     // p2Widen). Its x comes back to the pair's below, and the offset moves by however much farther
     // one half went than the other this tick -- a teleport trigger takes player 1 alone. Below 0.5 px
     // the two advances are the same step rounded at two magnitudes, and are not a move.
-    const bool p2x = g_p2xOff && s.frame == 0;
+    const bool p2x = s.frame == 0;
     if (p2x && s.dx2 != 0.f) sb.xAbs = (float)((double)sb.xAbs + (double)s.dx2);
     State cb = stepOne(sb, input, K, d2, &p2FlippedGravity);
     if (p2x) {
@@ -497,7 +499,7 @@ inline State stepBoth(const State& s, int input, const StepCtx& K, bool& dead) {
     // stepOne wrote into the swapped slot.
     if (g_dualSlide) c.slideT2 = cb.slideT2;
     // --dualhover: ...and its robot hover budget (State::rHover2)
-    if (g_dualHover) c.rHover2 = cb.rHover2;
+    c.rHover2 = cb.rHover2;
     // --dualdash: ...and its dash (State::dashing2 / dashSlope2), for the same reason
     { c.dashing2 = cb.dashing2; c.dashSlope2 = cb.dashSlope2; }
     c.slopeUid02 = cb.slopeUid02;  c.slopeUidNow2 = cb.slopeUidNow2;
@@ -517,6 +519,7 @@ inline State stepBoth(const State& s, int input, const StepCtx& K, bool& dead) {
         c.rotNeg2 = cb.rotNeg2;
     }
     c.holdDead2 = cb.holdDead2;
+    if (g_dualJumpBuf) c.jumpBuf2 = cb.jumpBuf2;   // --dualjumpbuf
     { c.flipT2 = cb.flipT2; c.modeT2 = cb.modeT2; }   // --dualflipclock
     for (int i = 0; i < 3; ++i) c.portSeen2[i] = cb.portSeen2[i];
     for (int i = 0; i < 4; ++i) c.touchRing2[i] = cb.touchRing2[i];
@@ -543,10 +546,10 @@ inline State stepBoth(const State& s, int input, const StepCtx& K, bool& dead) {
     // cannot carry x, stopped 5 px later.
     if (s.dual && cb.dx != sb.dx) c.dx = cb.dx;
     // --dualband: ...and so does a MODE portal: playerWillSwitchMode calls updateDualGround for
-    // either body, after p1's, so the band the second half wrote is the pair's (frames.hpp
-    // g_dualBand). Taken only when that half's portal wrote it (g_bandPortalWrote); otherwise
+    // either body, after p1's, so the band the second half wrote is the pair's.
+    // Taken only when that half's portal wrote it (g_bandPortalWrote); otherwise
     // p1's stands.
-    if (g_dualBand && s.dual && p2WroteBand) {
+    if (s.dual && p2WroteBand) {
         c.bandFloor = cb.bandFloor;
         c.bandCeil = cb.bandCeil;
         c.bandRefY = cb.bandRefY;
@@ -566,7 +569,7 @@ inline State stepBoth(const State& s, int input, const StepCtx& K, bool& dead) {
     // flags as they stand when p2's portal fires -- p1 has finished its pass by then (c.mode), p2
     // has not reached a mode portal after the gravity one (s.mode2).
     if (p2FlippedGravity && s.dual && !unlinked
-        && sameModeFlags(g_dualBornPortal ? c.mode : s.mode, s.mode2)) {
+        && sameModeFlags(c.mode, s.mode2)) {
         const uint8_t want = (uint8_t)!c.flip2;
         if (c.flip != want) {
             c.flip = want;
@@ -584,7 +587,7 @@ inline State stepBoth(const State& s, int input, const StepCtx& K, bool& dead) {
         const uint8_t want = (uint8_t)!c.flip;
         if (c.flip2 != want) {
             c.flip2 = want;
-            if (g_rtlP2Ring && (p2RingFresh == 11 || p2RingFresh == 12 || p2RingFresh == 35
+            if ((p2RingFresh == 11 || p2RingFresh == 12 || p2RingFresh == 35
                                 || p2RingFresh == 32))
                 c.vy2 = -c.vy2;
             else c.vy2 = (float)((double)c.vy2 * 0.5);
@@ -668,6 +671,7 @@ inline State stepBoth(const State& s, int input, const StepCtx& K, bool& dead) {
                     c.pressSpent2 = sb.pressSpent;
                     c.holdDead2 = sb.holdDead;
                     c.hitG2 = p2HitG;
+                    if (g_dualJumpBuf) c.jumpBuf2 = (uint8_t)(input ? 1 : 0);
                 }
             } else {
                 c.flip = (uint8_t)!f1;
@@ -695,19 +699,20 @@ inline State stepBoth(const State& s, int input, const StepCtx& K, bool& dead) {
         c.mode = cb.mode2;
         c.mini = cb.mini2;
         c.pressSpent = cb.pressSpent2;
+        if (g_dualJumpBuf) c.jumpBuf = cb.jumpBuf2;   // --dualjumpbuf: +0x985 too
         // --dualendrot (constants.hpp): ...but a wave takes the second body's angle, as it eased this tick
-        if (g_dualEndRot && cb.mode2 == 4) c.rot = cb.rot2;
+        if (cb.mode2 == 4) c.rot = cb.rot2;
         c.dual = 0;
         c.onSlope = 0;
         c.slopeM = 0.f;
         c.snapObj = nullptr;
         c.snapDist = 0.f;
         // --p2xoff: ...the position includes x, which is the second body's own once they ran apart
-        if (g_p2xOff && s.frame == 0 && s.dx2 != 0.f) c.xAbs = cb.xAbs;
+        if (s.frame == 0 && s.dx2 != 0.f) c.xAbs = cb.xAbs;
     }
-    if (g_p2xOff && !c.dual) c.dx2 = 0.f;   // --p2xoff: the dual ended, the offset with it
+    if (!c.dual) c.dx2 = 0.f;   // --p2xoff: the dual ended, the offset with it
     // --ballscaleair: a ball whose gravity a partner call or the repel turned after its own step
-    if (g_ballScaleAir && !p2Solo) {
+    if (!p2Solo) {
         if (c.mode == 2 && c.flip != ballF1Own) c.ball728 = (uint8_t)((c.ball728 & ~3u) | 1u);
         if (c.dual && c.mode2 == 2 && c.flip2 != ballF2Own)
             c.ball728 = (uint8_t)((c.ball728 & ~12u) | 4u);
@@ -733,6 +738,7 @@ inline State stepBoth(const State& s, int input, const StepCtx& K, bool& dead) {
         }
     }
     dead = d1 || d2;
+    t_spiderFreshWarp = p1FreshWarp;
     markTouched(c, K, touchPreY(s, c, preBtnSet, preBtnY), s.action != 0,
                     input != 0 && s.action == 0, &s, input != 0);
     // The dual half used to skip this entirely, so a divergence measured in a dual section was

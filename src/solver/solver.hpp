@@ -1,6 +1,52 @@
 #pragma once
+#include <charconv>
+#include <cmath>
+#include <sstream>
 
 namespace solver {
+
+// A text sink with the formatting of a default-constructed std::ostream, for the level dumps (writeObjRects
+// below): ints in decimal, floats and doubles as `%g` with six significant digits (the stream's default,
+// which std::to_chars with chars_format::general and precision 6 is specified to give), bool as 0 / 1. The
+// stream took ~60 insertions a row and 2.8 s for a 167k-object level; this appends into one string. A
+// value the stream spells in its own way (nan, inf) is handed to a stream, so the text is the stream's
+// whatever the value. The overloads are exactly the types a dump row inserts: an operand of any other type
+// is a compile error here rather than a silent conversion.
+struct TextBuf {
+    std::string s;
+    TextBuf& operator<<(const char* p) { s.append(p); return *this; }
+    TextBuf& operator<<(char c) { s.push_back(c); return *this; }
+    TextBuf& operator<<(const std::string& v) { s.append(v); return *this; }
+    TextBuf& operator<<(bool v) { s.push_back(v ? '1' : '0'); return *this; }
+    TextBuf& operator<<(int v) { return integer(v); }
+    TextBuf& operator<<(unsigned v) { return integer(v); }
+    TextBuf& operator<<(long v) { return integer(v); }
+    TextBuf& operator<<(unsigned long v) { return integer(v); }
+    TextBuf& operator<<(long long v) { return integer(v); }
+    TextBuf& operator<<(unsigned long long v) { return integer(v); }
+    TextBuf& operator<<(float v) { return general((double)v); }
+    TextBuf& operator<<(double v) { return general(v); }
+    template <class T> TextBuf& operator<<(T) = delete;
+private:
+    template <class I> TextBuf& integer(I v) {
+        char b[24];
+        const auto r = std::to_chars(b, b + sizeof b, v);
+        s.append(b, (size_t)(r.ptr - b));
+        return *this;
+    }
+    TextBuf& general(double v) {
+        if (!std::isfinite(v)) {
+            std::ostringstream o;
+            o << v;
+            s += o.str();
+            return *this;
+        }
+        char b[40];
+        const auto r = std::to_chars(b, b + sizeof b, v, std::chars_format::general, 6);
+        s.append(b, (size_t)(r.ptr - b));
+        return *this;
+    }
+};
 
 struct TickInfo {
     float x;
@@ -271,7 +317,10 @@ inline float forceOf(GameObject* obj) {
     return fb ? fb->m_force : 0.f;
 }
 
-inline void writeObjRects(std::ostream& rf, GJBaseGameLayer* l) {
+// The one body, written once for both sinks: a std::ostream (the reference formatting) and a TextBuf
+// (the fast one, same text). `Out` is only ever inserted into.
+template <class Out>
+inline void writeObjRectsTo(Out& rf, GJBaseGameLayer* l) {
     // ---- objrects.txt: GD's own real hitbox dimensions -----------------------
     // Columns: id,type,cx,cy,w,h,groups,uid,radius,rot,sy0,sy1,shz,sdir,sup,w0,h0,
     //     tpy,tpg,tpix,tpiy  (columns are only ever appended at the end: existing
@@ -302,8 +351,8 @@ inline void writeObjRects(std::ostream& rf, GJBaseGameLayer* l) {
     //   value, not an offset). tpg=m_gravityMode (1=force normal 2=force flipped
     //   3=toggle 0=unchanged), tpix/tpiy=m_ignoreX/Y. Fires on a plain rect
     //   overlap; vy/x are unchanged.
-    //   m_saveOffset (prop 351) is not emitted (leveldp warns if a level using
-    //   it shows up)
+    //   m_saveOffset (prop 351) is emitted in the columns tpsave, tpxoff, tpry at
+    //   the end of the row (see there)
     //   [2026-08-18 correction] The closed form for tpy is for id 747 ONLY.
     //   When m_orangePortal (portal+0x748) is linked, teleportPlayer overwrites
     //   m_teleportYOffset on the spot with "exit.y − entry.y" (0x20fe44), and
@@ -394,7 +443,13 @@ inline void writeObjRects(std::ostream& rf, GJBaseGameLayer* l) {
     // - extcol: GameObject::m_hasExtendedCollision (+0x280, property 511). addToSection (0x226500) files
     //   such an object in the collision pass's always-checked list instead of its section cell, and
     //   checkCollisions tests that list every tick after the 3x3 cells around the player.
-          "extcol\n";
+          "extcol,"
+    // - tpsave / tprx / tpry: a teleport portal's m_saveOffset (property 351) and its real position. With the
+    //   flag the body keeps its place relative to the portal: p' = exit + (p - real position of the entry),
+    //   both axes (measured on a custom level: y' = exit y + (y - 720) for entry heights 705 to 762, and x
+    //   14.70 behind where it would have been, which is exit x - real x = 3,347 - 3,361.7, not the bounding
+    //   box centre 3,369 that cx holds). 0 on every other row.
+          "tpsave,tprx,tpry\n";
     // PlayLayer's anti-cheat spike (id 8, created last, at 0,105) sits in m_objects but never
     // collides: GD only hands it to destroyPlayer as a check (hooks_playlayer.cpp). Written out,
     // the model read it as a hazard on the spawn point and a ship or ball start died on tick 2
@@ -416,6 +471,8 @@ inline void writeObjRects(std::ostream& rf, GJBaseGameLayer* l) {
         double tpy = 0.0, tpex = 0.0, tpey = 0.0;
         int tpg = 0, tpix = 0, tpiy = 0;
         int tpfm = 0;
+        int tpsave = 0;
+        double tprx = 0.0, tpry = 0.0;
         float tpf = 0.f, tpang = 0.f, tprmod = 0.f, tprmin = 0.f, tprmax = 0.f;
         // The teleport TRIGGER (id 3022) is a TeleportPortalObject too, created as a trigger:
         // EffectGameObject::triggerObject (0x4a5f30, its id table at 0x4a8384 / 0x4a8350) sends it
@@ -433,6 +490,12 @@ inline void writeObjRects(std::ostream& rf, GJBaseGameLayer* l) {
             tpg = tp->m_gravityMode;
             tpix = tp->m_ignoreX ? 1 : 0;
             tpiy = tp->m_ignoreY ? 1 : 0;
+            tpsave = tp->m_saveOffset ? 1 : 0;
+            if (tpsave) {
+                const auto rp = obj->getRealPosition();
+                tprx = (double)rp.x;
+                tpry = (double)rp.y;
+            }
             GameObject* exitObj = nullptr;
             if (tp->m_orangePortal) {
                 exitObj = tp->m_orangePortal;
@@ -622,8 +685,31 @@ inline void writeObjRects(std::ostream& rf, GJBaseGameLayer* l) {
            << "," << tprmod << "," << tprmin << "," << tprmax
            << "," << optudg
            << "," << (obj->m_hasExtendedCollision ? 1 : 0)
+           << "," << tpsave << "," << tprx << "," << tpry
            << "\n";
     }
+}
+
+inline void writeObjRects(std::ostream& rf, GJBaseGameLayer* l) { writeObjRectsTo(rf, l); }
+
+// The same text as writeObjRects gives, LF line ends, built without a stream.
+inline std::string objRectsText(GJBaseGameLayer* l) {
+    TextBuf b;
+    b.s.reserve(l && l->m_objects ? (size_t)l->m_objects->count() * 160 : 0);
+    writeObjRectsTo(b, l);
+    return std::move(b.s);
+}
+
+// The text buildPois wrote to objrects.txt in this reset, for the solve that starts in the same reset to take as
+// its level table instead of making it a second time (repair.hpp start): the layer it describes and the text. Set
+// by buildPois, taken (and emptied) by the first start() on that layer, and emptied at the end of the reset
+// that made it, so nothing outlives the moment the objects stood as it describes.
+inline GJBaseGameLayer* g_objRectsLayer = nullptr;
+inline std::string g_objRectsText;
+inline void forgetObjRectsText() {
+    g_objRectsLayer = nullptr;
+    std::string gone = std::move(g_objRectsText);   // destroyed here, its buffer with it
+    g_objRectsText = std::string();
 }
 
 // Extract orb POIs etc. from the level's live memory (m_objects).
@@ -781,8 +867,12 @@ inline void buildPois(GJBaseGameLayer* l, bool obbNoLatch = false) {
            << "," << p.x << "," << p.y << "\n";
     }
     {
+        // Made once: for this file and for the solve that starts in the same reset (g_objRectsText). The file is
+        // opened in text mode, as the stream write was, so the LF ends become CRLF exactly as before.
+        g_objRectsText = objRectsText(l);
+        g_objRectsLayer = l;
         std::ofstream rf(std::string(DATA_DIR) + "/objrects.txt", std::ios::trunc);
-        writeObjRects(rf, l);
+        rf.write(g_objRectsText.data(), (std::streamsize)g_objRectsText.size());
     }
     // ---- obb.txt: GD's own oriented hitboxes ---------------------------------
     // Activation of rotated objects can be explained neither by the bounding box
@@ -952,8 +1042,8 @@ inline void buildPois(GJBaseGameLayer* l, bool obbNoLatch = false) {
               // [2026-09-04] Appended, never inserted, same rule as above: a
               // reader that stops at lockrot keeps working and every existing
               // dump stays valid.
-              // sdelay: THE SPAWN TRIGGER'S DELAY (m_spawnTriggerDelay, key
-              // 63). The `dur` column is m_duration, which a Spawn does not
+              // sdelay: THE SPAWN TRIGGER'S DELAY (SpawnTriggerGameObject::
+              // m_spawnDelay, key 63; see the writer). The `dur` column is m_duration, which a Spawn does not
               // use -- lv22's 141 spawns all read dur=0.5 because that is the
               // constructor's default, and the delay that actually schedules
               // the chain was not dumped at all. GD fires the chain
@@ -1031,7 +1121,20 @@ inline void buildPois(GJBaseGameLayer* l, bool obbNoLatch = false) {
               //               the target group toward player 1's y by a share of the gap
               //               each tick. Written on every row (the defaults where the
               //               row is not a 1814).
-              "sponly,fyspd,fydel,fyoff,fymax\n";
+              //   lockcamx/lockcamy: a Move's m_lockToCameraX / m_lockToCameraY
+              //               (properties 141 / 142): the group moves with the camera, as
+              //               lockx/locky make it move with the player.
+              //   events/evextra: an Event trigger's (EventLinkTrigger, 3604) m_eventIDs
+              //               (property 430, ';'-separated GJGameEvent values, '-' on any other
+              //               row) and m_extraID:m_extraID2 (447 / 525). Its crossing registers
+              //               a listener (activateEventTrigger 0x232110); gameEventTriggered
+              //               (0x231ff0) spawns the target group when one of the events happens.
+              //   ctrobj: the uid of the object the game takes for m_centerGroupID, the way
+              //               tryGetMainObject (0x224520) and processRotationActions (0x22b7f0)
+              //               find it: the group's registered parent (m_parentGroupsDict, key 274)
+              //               first, else the group's only member. -1 when neither exists (a Rotate
+              //               then turns each object about itself), 0 with no centre group.
+              "sponly,fyspd,fydel,fyoff,fymax,lockcamx,lockcamy,events,evextra,ctrobj\n";
         // uid → groups it belongs to. One object can belong to several groups,
         // so the mapping is many-to-many
         std::ofstream gf(std::string(DATA_DIR) + "/objgroups.txt", std::ios::trunc);
@@ -1105,6 +1208,13 @@ inline void buildPois(GJBaseGameLayer* l, bool obbNoLatch = false) {
             }
             if (!e || e->m_targetGroupID == 0) continue;
             auto tr = obj->getObjectRect();
+            // A Spawn's delay is SpawnTriggerGameObject::m_spawnDelay (property 63, +0x780), the float
+            // SpawnTriggerGameObject::triggerObject (0x4b91f0) schedules the group by (plus a draw within
+            // m_delayRange, property 556, which is not dumped). EffectGameObject::m_spawnTriggerDelay is another
+            // field: it read 0 on every Spawn of the cov126 kits (14,736 rows; the level strings give 5,726 of
+            // them a delay) and on all 141 of lv22's (34 with one).
+            float sdelay = e->m_spawnTriggerDelay;
+            if (auto* sp = geode::cast::typeinfo_cast<SpawnTriggerGameObject*>(obj)) sdelay = sp->m_spawnDelay;
             tf << obj->m_uniqueID << "," << obj->m_objectID << ","
                << (tr.origin.x + tr.size.width * 0.5f) << ","
                << (tr.origin.y + tr.size.height * 0.5f) << ","
@@ -1130,7 +1240,7 @@ inline void buildPois(GJBaseGameLayer* l, bool obbNoLatch = false) {
                << (e->m_spawnOrdered ? 1 : 0) << ","
                << e->m_times360 << ","
                << (e->m_lockObjectRotation ? 1 : 0) << ","
-               << e->m_spawnTriggerDelay << ","
+               << sdelay << ","
                << (e->m_useMoveTarget ? 1 : 0) << ","
                << (int)e->m_moveTargetMode << ","
                << e->m_targetModCenterID << ","
@@ -1188,7 +1298,42 @@ inline void buildPois(GJBaseGameLayer* l, bool obbNoLatch = false) {
                 auto* ring = geode::cast::typeinfo_cast<RingObject*>(obj);
                 tf << "," << ((ring && ring->m_isSpawnOnly) ? 1 : 0) << ","
                    << e->m_followYSpeed << "," << e->m_followYDelay << ","
-                   << e->m_followYOffset << "," << e->m_followYMaxSpeed << "\n";
+                   << e->m_followYOffset << "," << e->m_followYMaxSpeed << ","
+                   << (e->m_lockToCameraX ? 1 : 0) << "," << (e->m_lockToCameraY ? 1 : 0);
+                {
+                    std::string evs, evx = "0:0";
+                    if (auto* ev = geode::cast::typeinfo_cast<EventLinkTrigger*>(obj)) {
+                        for (const int id : ev->m_eventIDs) evs += (evs.empty() ? "" : ";") + std::to_string(id);
+                        evx = std::to_string(ev->m_extraID) + ":" + std::to_string(ev->m_extraID2);
+                    }
+                    tf << "," << (evs.empty() ? "-" : evs) << "," << evx;
+                }
+                {
+                    int ctr = 0;
+                    if (e->m_centerGroupID > 0) {
+                        ctr = -1;
+                        GameObject* m = nullptr;
+#if GEODE_COMP_GD_VERSION >= 22090
+                        // 2.209: m_parentGroupsDict maps a group to the CCArray of the objects that are its parents (setGroupParent keeps
+                        // the main one first). Read as an object it gave a uid taken out of whatever lay 0x39c bytes past the array, and
+                        // where that page was not mapped the dump crashed the game.
+                        if (l->m_parentGroupsDict)
+                            if (auto* pa = static_cast<cocos2d::CCArray*>(l->m_parentGroupsDict->objectForKey(e->m_centerGroupID));
+                                pa && pa->count() > 0)
+                                m = static_cast<GameObject*>(pa->objectAtIndex(0));
+#else
+                        // 2.2081: the dictionary holds the parent object itself (measured: the dumps read this way carry real uids, and
+                        // the same dump read as an array crashes in CCArray::count).
+                        if (l->m_parentGroupsDict)
+                            m = static_cast<GameObject*>(l->m_parentGroupsDict->objectForKey(e->m_centerGroupID));
+#endif
+                        if (!m)
+                            if (auto* g = l->getGroup(e->m_centerGroupID); g && g->count() == 1)
+                                m = static_cast<GameObject*>(g->objectAtIndex(0));
+                        if (m) ctr = m->m_uniqueID;
+                    }
+                    tf << "," << ctr << "\n";
+                }
             }
             ++nTrig;
         }

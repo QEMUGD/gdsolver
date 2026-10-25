@@ -35,6 +35,7 @@ struct Obj {
     // and only dies when it reaches the ordinary solid stacked above them.
     // Dropped onto the same column from above it lands on the top face and
     // stands there. Modelled as: landing yes, kill no.
+    // 2: a static solid with the passable byte (--nocolstatic), the same top but left out of a turned frame.
     uint8_t oneway = 0;
     // Which bit of State::portalLatch this gravity portal owns, or -1 for
     // everything that is not one. GD latches a portal the first time the player
@@ -53,6 +54,9 @@ struct Obj {
     // tick from the recording or the trigger definitions). Fixups do not
     // apply near one -- see nearDynObject in fixup.hpp.
     uint8_t dynObj = 0;
+    // A ring a Rotate turns (Dynamics::turnedBox, --ringturn, with the recording's angle changing).
+    // --ringrectgate leaves it out: when GD rebuilds such a ring's cached rect is not read yet.
+    uint8_t rotTurned = 0;
     // Extended Collision (GameObject::m_hasExtendedCollision, +0x280, level property 511), from the
     // objrects `extcol` column. addToSection (0x226500) files such an object in the collision pass's
     // always-checked list (+0x35e0) instead of a section cell, so --bigsection leaves it alone.
@@ -133,6 +137,14 @@ struct Obj {
     // 1905.000, exactly its unexported orange half. 0,0 = column absent or no
     // linked exit (old dumps); the teleport block falls back to tpY and warns.
     double tpEx = 0.0, tpEy = 0.0;
+    // A teleport portal's m_saveOffset (objrects tpsave, tprx, tpry; --tpsaveoff): the body keeps its place
+    // relative to the portal's REAL position: y' = tpY + (y - tpRY), x' = exit x + (x - real x), i.e. x moves
+    // by tpXOff = tpEx - real x (negative: back).
+    uint8_t tpSave = 0;
+    double tpXOff = 0.0, tpRY = 0.0;
+    // ...with ignoreX the exit's x is the body's own: x' = x + (x - tpRX), tpRX the entry's real x (tpSaveIgx)
+    double tpRX = 0.0;
+    uint8_t tpSaveIgx = 0;
     // getFlipY(). Used only for the blue (gravity) pad's gate -- see
     // objFacingDown(). objrects' 31st column (flipy). Falls back to 0 in an old
     // export that lacks the column.
@@ -287,53 +299,12 @@ inline bool orientedHit(const Obj& o, double px, double py, double half,
 // fixups instead (a kill record at the measured transition), and stays in
 // fixups_log as the to-fix entry for a per-mode hazard box.
 constexpr double kSawMargin = 0.05;
-// ...and the per-mode deviation the note above calls for. Only the two modes
-// with an actual measurement deviate from the default:
-//   robot: GD's boundary is r + 0.07..0.12 (lv19 saw 187, injected sweep) ->
-//          take the middle, 0.10. The old 0.05 let the search graze 0.02..0.07
-//          closer than GD tolerates, and every such plan came back as a GD
-//          death + a kill fixup (36 of them in fixups_log_lv19).
-//   ball:  GD survives a graze at r - 0.05 (lv12 t=16797) -> the kill radius
-//          sits below that, so the addend is NEGATIVE. Loosening only ADDS
-//          candidate states; a false pass dies in replay and records a fixup.
-// Ship stays at the default: 0.15 across the board regressed lv16's ship
-// section, which is how the margin was found to be per-mode at all.
-// (The ball and the ship have since gone to 0 -- the two notes below.)
-// Saw exact (was --sawexact, always on since 2026-09-26):
-// the BALL's addend is 0, not -0.05. Four old custom levels kill a full ball at a corner distance
-// of 32.276-32.285 from a 32.3 saw (id 88/186: t=4,256, t=18,231, t=8,011,
-// t=9,847), inside the ball's r - 0.05 by 0.03. The addends were fitted before the 0.001
-// vy grid was reproduced (kSawMargin's note), but only the ball's has a witness against it:
-// taking every mode to 0 changed a custom level's route through its saws and the cold stopped against
-// the wall at x=28,575 (it clears with the cube's and robot's addends kept).
-// Saw exact ship (was --sawexactship, always on since 2026-09-26):
-// the SHIP's addend is 0 too. It was never measured -- it is the default the note above left in
-// place -- and another old custom level has a witness against it: a mini ship at t=3,297 with its
-// box corner 32.3037 from a 32.3 saw (uid 1184) that GD does not kill (it kills on the next tick,
-// at 31.66), where the default 0.05 killed a tick early.
-// --sawexactwave (default on since 2026-10): the WAVE's addend is 0 as well. A custom level's wave zig-zags over a
-// static saw (uid 3970, id 1707, scaled radius 9.30225) with its box corner 9.3074 from the centre at
-// t=378 and its box edge 9.3022 above it at t=380/382/384, and GD kills none of them; the default 0.05
-// killed it at t=378 (the wave's addend was never measured -- it is the default above).
-inline bool g_sawExactWave = true;
-// --sawexactufo (default on since 2026-10): the UFO's (mode 3) addend is 0 too. A custom level's upside-down UFO passes a
-// group-moved saw (id 187, radius 21.87) with its box corner 21.8907 from the centre and GD lets it live that
-// tick, where the default 0.05 killed it a tick early. Injecting the UFO's y on the tick before and sweeping it
-// puts GD's boundary between 21.8654 (dies) and 21.8708 (lives): the radius itself, nothing added (the UFO's
-// addend was never measured -- it is the default above).
-inline bool g_sawExactUfo = true;
-// --sawexactcube (default on since 2026-10): the CUBE's (mode 0) addend is 0 as well. The note above kept the cube's 0.05
-// because taking every mode to 0 moved one custom level's route against a wall -- a route effect, not a
-// measurement. Measured in an official level: a cube injected in the air beside a static saw (id 1734, radius 32)
-// dies at a box-corner distance of 32.00 and lives at 32.02, so GD's boundary is the radius itself and the
-// default 0.05 kills a band GD flies through.
-inline bool g_sawExactCube = true;
 inline double sawMarginFor(uint8_t mode) {
     if (mode == 5) return 0.10;
     if (mode == 2 || mode == 1) return 0.0;
-    if (mode == 4 && g_sawExactWave) return 0.0;
-    if (mode == 3 && g_sawExactUfo) return 0.0;
-    if (mode == 0 && g_sawExactCube) return 0.0;
+    if (mode == 4) return 0.0;
+    if (mode == 3) return 0.0;
+    if (mode == 0) return 0.0;
     return kSawMargin;
 }
 
@@ -418,21 +389,6 @@ inline bool outOfSweepReach(const Obj* o, double x0, double y0, double x1,
         || o->cy + ey + reach < std::min(y0, y1) || o->cy - ey - reach > std::max(y0, y1);
 }
 
-// --holdtap (default on since 2026-10): a hazard in the group of a Touch trigger (1595) in hold mode with toggle
-// "off" (properties 81 = 1, 82 = 2), crossed on the x queue, is off on a tick whose previous tick had
-// the button down and on otherwise -- the state's own button, not the recording's. The recording is
-// one attempt's presses, so a plan that holds where that attempt released met the spikes it had
-// switched on, and the search found no way through. Measured on a custom level (Touch uid at
-// x=16,725, eight spikes of group 101 on a floor, x 17,248-17,676), replaying one plan with the
-// release moved: released on 9,779 / 9,790 / 9,800 / 9,815 / 9,830 / 9,960 -> dead on the next tick
-// (on a spike), on 9,970 / 9,985 / 10,010 -> alive 90 ticks on; and the recordings put the switch a
-// tick after the button: a press on 9,805 has the spike off from row 9,806, a release on 9,830 on from
-// 9,831. In the corpus (2026-10-10): 6 of 531 levels have a hold-mode 1595 at all, and of the 183 with
-// a kit only that one level's targets a solid or a hazard -- eight hazards, no solid, so only the
-// hazard test reads it. A press held from before the trigger's crossing counts as down, which GD,
-// with no fresh press after it, may not do (the --ctrltouch rule says the same). Needs --heldall
-// (State::held is the button in every mode); frame 0 only.
-inline bool g_holdTap = true;
 inline thread_local int8_t t_holdHeld = -1;   // the stepped state's button on the previous tick; -1: none
 inline thread_local double t_holdX = 0.0;     // ...and its x at the start of the tick
 inline bool holdTapGone(const Obj* o) {
@@ -444,7 +400,6 @@ inline bool holdTapGone(const Obj* o) {
 // button is part of the state, as nearCtrlHoldBox makes it for --ctrltouch.
 inline std::vector<std::pair<double, double>> g_holdTapSpans;
 inline bool nearHoldTap(double x) {
-    if (!g_holdTap) return false;
     for (const auto& sp : g_holdTapSpans)
         if (x >= sp.first - 30.0 && x <= sp.second + 15.0) return true;
     return false;
@@ -453,7 +408,7 @@ inline bool nearHoldTap(double x) {
 inline bool hazardHit(const Obj* o, double px, double py, double half,
                       double margin, double sawAdd = kSawMargin,
                       int mode = -1, int mini = 0) {
-    if (g_holdTap && holdTapGone(o)) return false;
+    if (holdTapGone(o)) return false;
     if (o->radius > 0.0) {
         const double dx = px - o->cx, dy = py - o->cy;
         const double hRect = sawRectHalfB(mode, mini);   // -1 when unmeasured
@@ -616,7 +571,7 @@ inline bool hazardHit(const Obj* o, double px, double py, double half,
 // kills, and the unturned square missed the box's normal axis by 0.24 px -- the model died a tick late.
 inline bool hazardStage1(const Obj* o, double px, double py, double half, double margin, double sawAdd,
                          int mode, int mini, bool boxFollows) {
-    if (g_hazRectGate && boxFollows && o->obbOk && o->radius <= 0.0)
+    if (boxFollows && o->obbOk && o->radius <= 0.0)
         return std::fabs(px - o->cx) <= o->hw + half + margin
             && std::fabs(py - o->cy) <= o->hh + half + margin;
     return hazardHit(o, px, py, half, margin, sawAdd, mode, mini);

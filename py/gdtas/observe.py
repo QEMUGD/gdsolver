@@ -65,6 +65,9 @@ def launch_visible(worker_id: int, cfg_lines: list[str],
 
     for name in ("result.txt", "trace.csv", "dump.csv", "cmd.txt", "plan_in.txt"):
         (w.data / name).unlink(missing_ok=True)
+    # A launch for a person to watch asks for the replay panel itself (a worker's launch turns it off, worker.py).
+    if not any(ln.strip().startswith("replaypanel=") for ln in cfg_lines):
+        cfg_lines = list(cfg_lines) + ["replaypanel=1"]
     (w.data / "autorun.cfg").write_bytes(("\n".join(cfg_lines) + "\n").encode("ascii"))
     for src in extra_files or ():
         if Path(src).exists():

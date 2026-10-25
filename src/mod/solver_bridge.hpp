@@ -43,6 +43,20 @@ inline void dpSelfTest(GJBaseGameLayer* l) {
                         : (disk == csv ? "same as objrects.txt" : "DIFFERS from objrects.txt");
     writeResult("dpselftest: in-memory csv " + std::to_string(csv.size()) + " bytes, disk "
                 + std::to_string(disk.size()) + " bytes - " + verdict);
+    // The level table is made without a stream (solver::objRectsText) and buildPois keeps that text for the solve
+    // that starts in the same reset: both must be the stream's text, byte for byte.
+    {
+        const std::string fast = solver::objRectsText(l);
+        writeResult("dpselftest: objrects writer without a stream " + std::string(fast == csv ? "IDENTICAL" : "DIFFERS")
+                    + " to the stream's (" + std::to_string(fast.size()) + " / " + std::to_string(csv.size())
+                    + " bytes)");
+        if (solver::g_objRectsLayer == l)
+            writeResult("dpselftest: the text buildPois kept for the solve "
+                        + std::string(solver::g_objRectsText == csv ? "IDENTICAL" : "DIFFERS")
+                        + " to the stream's now (" + std::to_string(solver::g_objRectsText.size()) + " bytes)");
+        else
+            writeResult("dpselftest: buildPois kept no text for this layer");
+    }
 
     const dpbridge::LevelStats s = dpbridge::statsFromCsv(csv);
     // Same words, same order and same formatting as leveldp's own `level:` line, so the two

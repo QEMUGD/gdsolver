@@ -175,7 +175,27 @@ inline double g_speedDodgeMin = 0.0;
 inline double g_glitchPortal = 0.0;
 inline double g_glitchWave = 0.0;
 inline double g_glitchEmbed = 0.0;
-//   --glitchdeco         a decoration that is a hazard's look (90% of its placements sit on
+//   --wavecentre <px>   the wave-behaviour option (Avoid glitches, third choice; 0 = off): a wave that ends
+//                       a tick within this many px of the band's floor or ceiling, of a solid (the faces it
+//                       could slide on included, unlike --glitchwave), or riding a ramp is dropped -- it is
+//                       crawling along the terrain, not flying the corridor. Only the clearance is asked
+//                       for, so a corridor narrower than twice this leaves no wave states (the loop then
+//                       falls back to --glitchwave alone, src/mod/repair.hpp escalate).
+inline double g_waveCentre = 0.0;
+//   --wavetidy <S> / --wavetoggle <T>   a PREFERENCE among wave routes, not a drop (0 = off). The route's own
+//                       State::tight (the goal pick already reads it: lower is roomier) takes, on every wave tick,
+//                       floor(S * off^2) where off is how far the wave sits from the middle of the corridor it is
+//                       in (0 centre, 1 wall; corridor = the band's floor and ceiling and the solids above and
+//                       below), and T for every change of the button. With either on, each layer's frontier is
+//                       put in stable order of that score before it is stepped, so the first-accepted-wins dedupe
+//                       keeps the tidier route into a cell.
+inline double g_waveTidy = 0.0;
+inline int g_waveToggle = 0;
+//   --startedge <ticks>  an anchored call: the ticks the button had already been in its present state at the anchor
+//                        (State::edgeAge of the start state; -1 = not said, which leaves it at "long ago"). The mod
+//                        reads it off the plan the game flew, so --wavepulse / --minpulse hold across a re-anchor.
+inline int g_startEdge = -1;
+//   --glitchdeco        a decoration that is a hazard's look (90% of its placements sit on
 //                        that hazard) and is placed without one is loaded as that hazard
 //                        (level_loader.hpp addHazardLookalikes, where g_glitchDeco lives: the
 //                        loader comes first in the header chain): the hole in lv20's first
@@ -221,6 +241,11 @@ inline double g_coinWinLen = 0.0;
 // On by default since 2026-10-07 (lv22 cold without a section-solver handoff); --no-ladderovercap is the
 // off arm.
 inline bool g_ladderOverCap = true;
+// --ladderovercapstop (off): the second over-cap step (the window at 4x --cap) is skipped for the plain search when the
+// first (2x) left the death where it was: not later than the attempt before it, at the same state count to the
+// state. A long ship/wave level: in 17 whole-level ladder calls the 8000 rung found exactly what the 4000 one had,
+// 53 s of the run's 1,715. Where the 2x step moves the death the 4x step is taken as before.
+inline bool g_ladderOverCapStop = false;
 // --capenvelope (off; --ladderenv passes it to the attempts after a coin's miss prune, cli.hpp
 // cliMain): a class the alive cap thins keeps its lowest and its highest state
 // (by y, then vy, then layer order) before the stride takes the rest of its share. The stride

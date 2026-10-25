@@ -90,8 +90,14 @@ struct AnchorRow {
     // anchor without it re-accumulates from zero -- which mid-section is tens of degrees away
     // from GD and flips that test's verdict outright.
     float rot = 0.f;
-    float rot2 = 0.f;        // ...and the second body's (the dump's p2rot; cfg dpanchorrot2)
+    float rot2 = 0.f;        // ...and the second body's (the dump's p2rot)
     float speed = 0.f;       // GD's own speed multiplier, so the model need not re-derive it
+    // Player 1's m_gravityMod (+0xb84): a touch-triggered gravity trigger (2066) sets it from the touch, which
+    // no x says, so the anchor tells dp (--startgmod, dp --gravtouch).
+    float gmod = 1.f;
+    // The farthest x of the attempt so far: a teleport can move the player back, and GD's crossing queue
+    // (checkSpawnObjects) then waits for x to pass it again (--startxhi, dp --tpback).
+    float xmax = 0.f;
     int gframe = 0;          // rotated gameplay (0/1/2/3 = 0/90/180/270)
     int snapUid = -1;        // m_objectSnappedTo's uid, and how far it snapped
     float snapDist = 0.f;
@@ -366,6 +372,8 @@ inline void record(GJBaseGameLayer* l, long long t) {
     r.rot = p->getRotation();   // the dump's `rot` column, from the same call
     r.rot2 = (r.dual && l->m_player2) ? l->m_player2->getRotation() : 0.f;   // `p2rot`
     r.speed = (float)p->m_playerSpeed;
+    r.gmod = (float)p->m_gravityMod;
+    r.xmax = (t > 0 && g_live[(size_t)t - 1].valid) ? std::max(g_live[(size_t)t - 1].xmax, r.x) : r.x;
     r.gframe = g_gameFrame;
     r.snapUid = p->m_objectSnappedTo ? p->m_objectSnappedTo->m_uniqueID : -1;
     r.snapDist = p->m_snapDistance;
@@ -552,28 +560,45 @@ inline std::string touchEnteredArg(long long t0) {
     return out.empty() ? std::string("-") : out;
 }
 
-// dp's --slambox among the extra arguments (cfg dparg): the last of --slambox / --no-slambox decides, as the
-// CLI reads them. --slambox is on by default in the CLI since 2026-10, so this starts on too: a default read
-// as off here would send no --rectouch, and the flag would have no recorded touches to judge by. Off,
-// --rectouch is not passed.
-inline bool solverSlamBox() {
-    bool on = true;
-    for (const auto& a : g_cfg.dpArgs) {
-        if (a == "--slambox") on = true;
-        else if (a == "--no-slambox") on = false;
+// (dp's --slambox and --formularec are always on, so --rectouch and --recprov are always passed: a default that
+// read as off here would send neither, and the solver would judge by no recorded touches and read a recording
+// from another attempt. Their off arms were removed in v0.6.0; dp refuses the spellings by name.)
+
+// --rectouchentered: touchEnteredArg's test over a recording's OWN attempt's rows (all of them), kept with
+// the recording when harvestGroups adopts it (g_groupsTouchArg). The anchor's rows are another attempt's
+// whenever the kept recording is deeper than the anchor's attempt got (recProvArg).
+// cfg recenteredfire: `fired` (that attempt's touchfire map) dates a box the rows never meet at its load-time
+// place -- one that rides a moving object -- by GD's own fire tick. SubZero 4002 coin: toggle box uid 18125
+// follows a moved object; the recording's attempt fired it and its rows switch a group off, the rows' test
+// missed it, and dp kept the switch for an attempt that never touched the box.
+inline std::string touchEnteredRows(const std::vector<AnchorRow>& v,
+                                    const std::unordered_map<int, int>* fired = nullptr) {
+    std::string out;
+    for (const TouchTog& T : g_touchBoxes) {
+        bool found = false;
+        for (size_t t = 1; t < v.size(); ++t) {
+            const AnchorRow& r = v[t];
+            if (!r.valid) continue;
+            const double half = (r.mode == 4) ? (r.mini ? 2.0 : 5.0)
+                              : (r.mode == 6) ? (r.mini ? 8.1 : 13.5)
+                                               : (r.mini ? 9.0 : 15.0);
+            if (std::fabs((double)r.x - T.cx) < T.hw + half
+                && std::fabs((double)r.y - T.cy) < T.hh + half) {
+                if (!out.empty()) out += ",";
+                out += std::to_string(T.uid) + ":" + std::to_string(t);
+                found = true;
+                break;
+            }
+        }
+        if (!found && fired && g_cfg.recEnteredFire) {
+            const auto it = fired->find(T.uid);
+            if (it != fired->end() && it->second >= 0) {
+                if (!out.empty()) out += ",";
+                out += std::to_string(T.uid) + ":" + std::to_string(it->second);
+            }
+        }
     }
-    return on;
-}
-// ...and --formularec, the same way: --recprov goes out only under it. --formularec is on by default in the
-// CLI since 2026-10, so this starts on too: a default that read as off here would send no --recprov, and the
-// flag would read a recording from another attempt (the hole --recprov closes). --no-formularec turns both off.
-inline bool solverFormulaRec() {
-    bool on = true;
-    for (const auto& a : g_cfg.dpArgs) {
-        if (a == "--formularec") on = true;
-        else if (a == "--no-formularec") on = false;
-    }
-    return on;
+    return out.empty() ? std::string("-") : out;
 }
 
 // --rectouch: the touch triggers GD itself fired in the attempt the anchor rows come from -- touchfire's
@@ -610,7 +635,7 @@ inline std::string recTouchArg() {
     return s.empty() ? std::string("-") : s;
 }
 
-// cfg dpspentpad: dp's --spentpad, the pads this attempt had latched before t0 (padseed). Empty
+// dp's --spentpad, the pads this attempt had latched before t0 (padseed). Empty
 // when there are none -- dp then seeds only the pads in contact at t0, as without the cfg.
 // In uid order: the seeds are an unordered_map, whose iteration order is not fixed, and dp fills
 // its four usedPad slots in the order given, so the same pads could reach dp as a different call.
@@ -633,17 +658,7 @@ inline std::string spentOrbArg(long long t0) {
         if (f.second < t0) out += (out.empty() ? "" : ",") + std::to_string(f.first);
     return out;
 }
-// ...and p2's (dp --spentorb2), unless the call's extra arguments turn dp's --spentp2 off (the last of
-// --spentp2 / --no-spentp2 decides, as the CLI reads them). --spentp2 is on by default in the CLI since
-// 2026-10, so this starts on too; off, the argument list stays as it was.
-inline bool solverSpentP2() {
-    bool on = true;
-    for (const auto& a : g_cfg.dpArgs) {
-        if (a == "--spentp2") on = true;
-        else if (a == "--no-spentp2") on = false;
-    }
-    return on;
-}
+// ...and p2's (dp --spentorb2; dp's --spentp2 is always on, its off arm was removed in v0.6.0).
 inline std::string spentOrb2Arg(long long t0) {
     std::string out;
     for (const auto& f : anchors::seeds().rings2)
@@ -651,7 +666,7 @@ inline std::string spentOrb2Arg(long long t0) {
     return out;
 }
 
-// cfg dpxtrack: dp's --xtrack, GD's x on every tick of the anchor's attempt up to t0, so dp dates
+// dp's --xtrack, GD's x on every tick of the anchor's attempt up to t0, so dp dates
 // the autonomous triggers behind the anchor by where GD's player actually was (dp g_xTrack). The
 // file name carries the source buffer and t0, and it is written to a temporary and renamed: the
 // ladder's parallel arms can build the same argument at once, and a reader must never see half
@@ -817,7 +832,7 @@ constexpr int kRungs[] = {24, 96, 240, 600, 1500, 3600, 7200, 14400, 28800};
 constexpr long long kCap = 2000;
 constexpr double kYq = 0.25, kVq = 1.0;
 constexpr const char* kThreads = "8";
-// cfg dpfineretry (runLadder): the fine retry's search. The bins are the cube's (dp keyOf), the
+// runLadder's fine retry: its search. The bins are the cube's (dp keyOf), the
 // window runs kFineLead ticks past GD's death, and a ladder asks it at most kFineTriesPerLadder
 // times (one per doomed rung, shallow to deep).
 constexpr long long kFineCap = 50000;
@@ -1182,6 +1197,27 @@ inline bool startBootstrapRecord();
 inline void addFirstStart(std::vector<std::string>& a);
 inline bool g_coldRestarted = false;  // the prefix has been thrown away once
 inline int g_escalations = 0;         // how many times the ladder has been given another option
+// Avoid glitches' wave behaviour (Config::wavePulse / waveCentre) was dropped: the ladder found no anchor
+// with it, so the searches ran again with the glitch margins alone. baseArgs reads it. It holds for the stretch
+// that needed it only: g_waveRelaxedX is the deepest death at the time, and a death kWaveRelaxSpan px past it
+// (iteration handler) puts the wave behaviour back, so one forced crawl does not end it for the rest of the level.
+inline bool g_waveRelaxed = false;
+// ...and the glitch margins (portal / wave / embed) are eased the same way, in steps: a level that only a hairline
+// dodge of a portal or a hazard gets through (a route the game cleared passes such a portal under 2 px) cannot be
+// solved with the margins at their full size, so a wall with no anchor first loses the wave's behaviour, then has
+// the margins halved, quartered and finally switched off -- each for the stretch only. The stage indexes
+// kGlitchStageScale; baseArgs scales the margins by it, and a stage 0 is Avoid glitches as chosen.
+inline int g_glitchStage = 0;
+constexpr float kGlitchStageScale[] = {1.f, .5f, .25f, 0.f};
+constexpr int kGlitchStages = 4;
+inline float g_waveRelaxedX = -1.f;   // the deepest death when either was eased: the stretch is measured from it
+constexpr float kWaveRelaxSpan = 900.f;
+// Is there something left to ease? The wave's behaviour, or a margin not yet off.
+inline bool glitchSoftenable() {
+    return ((g_cfg.wavePulse > 1 || g_cfg.waveCentre > 0.0) && !g_waveRelaxed)
+        || ((g_cfg.glitchPortal > 0.0 || g_cfg.glitchWave > 0.0 || g_cfg.glitchEmbed > 0.0)
+            && g_glitchStage < kGlitchStages - 1);
+}
 
 // Nine significant digits, the same precision the dump is written with. Coarser than that and
 // the re-anchored x lands on the wrong side of a contact test near x=20,000.
@@ -1568,7 +1604,7 @@ constexpr float kOffBoard = 1200.f;
 // gives every credit the plain test gives, at the same tick, except the t=1 and the teleport
 // ones, and adds none.
 constexpr int kOffBoardTicks = 2;
-// cfg `offboardtp` (on by default since 2026-10): A TELEPORT THE BAND DOES NOT FOLLOW. The 4002 case above has the band
+// A TELEPORT THE BAND DOES NOT FOLLOW. The 4002 case above has the band
 // catching up one tick later; lv22 with coins has it not catching up for 112 ticks. t=1,818
 // (coin-on bundle cold, 2026-09-30, attempts 5/8/10/13): a spider goes from y=224.3 to 3,210.0 in
 // one tick. GD's camera goes with it on that tick (camy 27.5 -> 2,449.1), but pmin/pmax stay at the
@@ -1623,7 +1659,7 @@ inline long long offBoardTick(long long upTo, float& xAt) {
     for (long long t = 1; t <= upTo; ++t) {
         const AnchorRow* r = anchors::row(t);
         if (!r) continue;
-        if (g_cfg.offBoardTp && haveY && std::fabs(r->y - lastY) > kOffBoardTpDy) {
+        if (haveY && std::fabs(r->y - lastY) > kOffBoardTpDy) {
             armed = false;
             outT = -1;
         }
@@ -1681,6 +1717,8 @@ inline long long g_groupsDepth = -1;
 // recording, so the attempt behind g_groupsPath need not be the one an anchor's rows come from
 // (--recprov).
 inline long long g_groupsSerial = -1;
+// ...and the boxes that attempt entered (touchEnteredRows), for dp's --rectouchentered. "" = unknown.
+inline std::string g_groupsTouchArg;
 // --recprov <recording>,<anchor>,<reach>: the attempt behind the last --groups recording, the attempt the
 // anchor's rows are from (both g_attemptSerial, -1 = unknown) and the tick the recording reached. dp's
 // --formularec reads the recording as the state's own world only when the two are one attempt, and only
@@ -1982,7 +2020,7 @@ inline bool reverses(const std::vector<AnchorRow>& v, long long t, int gframe) {
 // reference recording (py/gdtas/rotseed.py seed_sim, the same rule) every one of its
 // turns is reproduced and all 106 section anchors come out exact (A: 58, E: 67); where
 // E is exact too the two seeds are identical (67 of 67).
-// cfg `rotseedpre` (off): a turn row whose walk fired nothing is walked once more at the position
+// A turn row whose walk fired nothing is walked once more at the position
 // BEFORE the tick's button -- the two rows before it carried on one tick. The game walks the queue
 // after physics and runs the button after the update, so a press that moves the player on the
 // turn's own tick (a spider's teleport) records a row the consumption never saw. lv22 on the
@@ -2196,7 +2234,7 @@ inline void fold(const std::vector<AnchorRow>& v) {
 inline bool rotSeedArgs(long long t0, std::vector<std::string>& a, const char* site) {
     if (g_cfg.dpRotSeed <= 0 || t0 <= 0) return false;
     const std::vector<AnchorRow>& v = *anchors::g_src;
-    rotseed::g_preButton = g_cfg.rotSeedPre;
+    rotseed::g_preButton = true;
     const rotseed::Seed s = rotseed::seedFor(v, t0, g_cfg.dpRotSeed);
     const AnchorRow* r0 = anchors::row(t0);
     // cfg dprotseedanchor=0: the anchored search is classified and logged like any other
@@ -2254,17 +2292,17 @@ inline void addWorldArgs(std::vector<std::string>& a) {
             writeResult(b);
         }
     }
-    if (g_cfg.dpGroups && !g_groupsBootPath.empty() && bootPart < 0
+    if (!g_groupsBootPath.empty() && bootPart < 0
         && std::filesystem::exists(g_groupsBootPath, ec)) {
         a.push_back("--groups");
         a.push_back(g_groupsBootPath);
     }
-    if (g_cfg.dpGroups && !g_groupsDeepPath.empty() && deepPart < 0
+    if (!g_groupsDeepPath.empty() && deepPart < 0
         && std::filesystem::exists(g_groupsDeepPath, ec)) {
         a.push_back("--groups");
         a.push_back(g_groupsDeepPath);
     }
-    if (g_cfg.dpGroups && !g_groupsPath.empty()
+    if (!g_groupsPath.empty()
         && std::filesystem::exists(g_groupsPath, ec)) {
         a.push_back("--groups");
         a.push_back(g_groupsPath);
@@ -2393,7 +2431,7 @@ inline void addWorldArgs(std::vector<std::string>& a) {
         a.push_back(wins2);
     }
     // The level's own compatibility flags, written beside objrects when the session opened.
-    // This one is NOT under dpWorld: kA39 changes the SHAPE of every circular hazard's test
+    // This one is not world state: kA39 changes the SHAPE of every circular hazard's test
     // (centre distance instead of the player's rect against the circle -- see hazardHit), which
     // is physics and not world state. The CLI finds the file next to the objrects path on its
     // own; the in-process caller passes the level in memory and argv[1] is a placeholder, so
@@ -2403,7 +2441,6 @@ inline void addWorldArgs(std::vector<std::string>& a) {
     if (std::filesystem::exists(lset, ec)) {
         a.push_back("--levelsettings"); a.push_back(lset);
     }
-    if (!g_cfg.dpWorld) return;
     const std::string trig = std::string(DATA_DIR) + "/triggers.txt";
     const std::string grp = std::string(DATA_DIR) + "/objgroups.txt";
     const std::string obb = std::string(DATA_DIR) + "/obb.txt";
@@ -2452,7 +2489,7 @@ inline void addWorldArgs(std::vector<std::string>& a) {
     const std::string areas = std::string(DATA_DIR) + "/areas.txt";
     if (std::filesystem::exists(areas, ec)) { a.push_back("--areas"); a.push_back(areas); }
     // The 2.2 rotation queue's inputs (solver.hpp writes rotgameplay.txt at session
-    // start). UNDER dpWorld, unlike levelsettings above: a queue entry is a trigger
+    // start). Unlike levelsettings above: a queue entry is a trigger
     // sitting at a position, i.e. world state, whereas kA39 changes the shape of a
     // hazard test and is physics -- the distinction :681-683 draws.
     //
@@ -2528,7 +2565,7 @@ inline std::string snapFile(const std::string& path) {
 inline constexpr const char* kFileArgs[] = {
     "--groups", "--fixups", "--bandtrack", "--rejoinwatch", "--replay",
     "--triggers", "--objgroups", "--obb", "--levelsettings", "--rotgameplay",
-    "--forceids", "--xtrack", "--items", "--areas"};
+    "--forceids", "--xtrack", "--items", "--areas", "--start-state"};
 inline bool isFileArg(const std::string& s) {
     for (const char* f : kFileArgs)
         if (s == f) return true;
@@ -2823,19 +2860,46 @@ inline std::vector<std::string> baseArgs(const std::string& out,
     }
     // ...and the glitch-avoid margins, the user's choice (Config::glitchPortal). Searches only:
     // the fixup resim builds its own argv and must not die where the game does not.
-    if (g_cfg.glitchPortal > 0.0) {
-        a.push_back("--glitchportal");
-        a.push_back(num(g_cfg.glitchPortal));
-    }
-    if (g_cfg.glitchWave > 0.0) {
-        a.push_back("--glitchwave");
-        a.push_back(num(g_cfg.glitchWave));
-    }
-    if (g_cfg.glitchEmbed > 0.0) {
-        a.push_back("--glitchembed");
-        a.push_back(num(g_cfg.glitchEmbed));
+    // ...eased by g_glitchStage where a wall had no anchor with them at full size (escalate).
+    {
+        const double sc = (double)kGlitchStageScale[std::clamp(g_glitchStage, 0, kGlitchStages - 1)];
+        if (g_cfg.glitchPortal > 0.0 && sc > 0.0) {
+            a.push_back("--glitchportal");
+            a.push_back(num(g_cfg.glitchPortal * sc));
+        }
+        if (g_cfg.glitchWave > 0.0 && sc > 0.0) {
+            a.push_back("--glitchwave");
+            a.push_back(num(g_cfg.glitchWave * sc));
+        }
+        if (g_cfg.glitchEmbed > 0.0 && sc > 0.0) {
+            a.push_back("--glitchembed");
+            a.push_back(num(g_cfg.glitchEmbed * sc));
+        }
     }
     if (g_cfg.glitchDeco) a.push_back("--glitchdeco");
+    // ...and the wave's behaviour (the menu's third choice), until a search with it found no anchor (escalate).
+    if (!g_waveRelaxed) {
+        if (g_cfg.wavePulse > 1) {
+            a.push_back("--wavepulse");
+            a.push_back(std::to_string(g_cfg.wavePulse));
+        }
+        if (g_cfg.waveCentre > 0.0) {
+            a.push_back("--wavecentre");
+            a.push_back(num(g_cfg.waveCentre));
+        }
+    }
+    // ...and dp's --ladderovercapstop wherever dphorizongrow acts (a level of dphorizongrowmin ticks or more): it was made for the grown plans of a very long level, and on the official levels it cost
+    // lv22 eight rounds (24 for 16), so it is not on dp's default.
+    if (g_cfg.dpHorizonGrow >= 100 && g_horizonFull >= g_cfg.dpHorizonGrowMin) a.push_back("--ladderovercapstop");
+    // The preferences drop no route, so a relaxed search keeps them.
+    if (g_cfg.waveTidy > 0.0) {
+        a.push_back("--wavetidy");
+        a.push_back(num(g_cfg.waveTidy));
+    }
+    if (g_cfg.waveToggle > 0) {
+        a.push_back("--wavetoggle");
+        a.push_back(std::to_string(g_cfg.waveToggle));
+    }
     addWorldArgs(a);
     // cfg dprejoinwatch: the model's trace of the plan that last died,
     // for dp's --rejoinwatch (refwatch.hpp).
@@ -2865,8 +2929,11 @@ inline std::vector<std::string> baseArgs(const std::string& out,
     }
     // (The witness resim inside this search fires the item gates too: the solver's fixed
     // behaviour since the 0.4.0 clean-up removed --walkgates.)
-    // cfg worldgates: the item gates are the world's without coinroute too (dp --worldgates).
-    if (g_cfg.worldGates) a.push_back("--worldgates");
+    // cfg worldgates: the item gates are the world's without coinroute too (dp --worldgates). Not with coinroute:
+    // dp's coin mode picks the gates a coin needs and where a counting Tap's window shuts (triggers.hpp, the coin
+    // root test), and --worldgates skips that test -- official lv22's coin run lost its third coin (a Tap counted
+    // up to six) and ran out of time with the flag passed beside --coins.
+    if (g_cfg.worldGates && !g_cfg.coinRoute) a.push_back("--worldgates");
     // ...and the pickups a Count trigger counts (items.txt, written beside the
     // level dump). Passed only with the gates: nothing else reads a counter.
     if (g_cfg.coinRoute || g_cfg.worldGates) {
@@ -3023,6 +3090,19 @@ inline int swingPendingAt(const std::vector<InputCmd>& plan, long long t0) {
 // dp --p2xoff's anchor: the second dual body's x offset from the first (p2x - x), as `--startp2dx`.
 // Written only for a pair that has run apart, so every other argv is as before; dp reads it only
 // under the flag.
+// dp --gravtouch's anchor: GD's gravity value there (AnchorRow::gmod), as `--startgmod`. dp seeds it only
+// where its crossing triggers give another value, so every anchor carries it.
+inline void addStartGmod(std::vector<std::string>& a, const AnchorRow* r) {
+    if (!r || !r->valid) return;
+    a.push_back("--startgmod");
+    a.push_back(num(r->gmod));
+    // dp --tpback's: the attempt's farthest x, when a teleport has put the anchor behind it
+    if (r->xmax > r->x + 0.5f) {
+        a.push_back("--startxhi");
+        a.push_back(num(r->xmax));
+    }
+}
+
 inline void addStartP2dx(std::vector<std::string>& a, const AnchorRow* r) {
     if (!r || !r->dual) return;
     const float d = r->x2 - r->x;
@@ -3044,11 +3124,19 @@ inline std::string startArg(long long t0, const AnchorRow& r, int held, int swin
     // mirrors the vertical so the gravity flag flips with it. Passing the raw number puts the
     // tail in a world whose gravity points the wrong way.
     int gf = r.gframe, rv = 0, flip = r.flip;
-    if (gf == 2) { gf = 0; rv = 1; }
+    if (gf == 2) {
+        gf = 0;
+        rv = 1;
+        // cfg anchorframe2dir: ...unless the player is going +x in world, which in frame 2 is a 2900 that
+        // reversed the player too, and is the model's frame 0 going forward.
+        if (g_cfg.anchorFrame2Dir)
+            if (const AnchorRow* prev = anchors::row(t0 - 1))
+                if ((double)r.x - (double)prev->x > 1e-6) rv = 0;
+    }
     else if (gf == 3) { flip = 1 - flip; }
     // Reversed gameplay (id 2900) is not a column GD has, but it is recoverable: the sign of
     // the movement along this frame's travel axis says which way the player is going.
-    if (rv == 0) {
+    if (rv == 0 && !(g_cfg.anchorFrame2Dir && r.gframe == 2)) {   // frame 2 is decided above
         const AnchorRow* prev = anchors::row(t0 - 1);
         if (prev) {
             const double d = (r.gframe % 2 == 1) ? (r.y - prev->y) : (r.x - prev->x);
@@ -3089,7 +3177,7 @@ inline std::string startArg(long long t0, const AnchorRow& r, int held, int swin
     // the official corpus produces (measured: lv16's cold run never has the halves differ) and
     // carries the truth on the custom levels where they do.
     s += "," + std::to_string(r.m2) + "," + std::to_string(r.mini2);
-    // cfg dpanchorrotstep: 28th/29th "not said" (-1, dp's own default for both) and the 30th, the
+    // The 28th/29th "not said" (-1, dp's own default for both) and the 30th, the
     // size of the step the angle just made, which dp takes as a ball's stake and ignores in every
     // other mode. A ball's stake outlives what wrote it, so without this an anchored ball in the
     // air does not turn until something stakes it again: a custom level, the 09-30 cold run's
@@ -3097,19 +3185,18 @@ inline std::string startArg(long long t0, const AnchorRow& r, int held, int swin
     // turned, and a turned portal's test reads that angle. Read from the rows like the 24th, so an
     // event on t0 that stakes for the next tick only (a ring) is not seen; m_rotationSpeed would
     // see it, but its scale against the angle's step is not measured here.
-    if (g_cfg.dpAnchorRotStep || (g_cfg.dpAnchorRot2 && r.dual)) {
+    {
         double step = 0.0;
-        if (g_cfg.dpAnchorRotStep)
-            if (const AnchorRow* prev = anchors::row(t0 - 1))
-                step = std::fabs(std::remainder((double)r.rot - (double)prev->rot, 360.0));
+        if (const AnchorRow* prev = anchors::row(t0 - 1))
+            step = std::fabs(std::remainder((double)r.rot - (double)prev->rot, 360.0));
         s += ",-1,-1," + num(step);
     }
-    // cfg dpanchorrot2: the 31st-33rd, the second body's angle and the sign and size of the step
+    // The 31st-33rd, the second body's angle and the sign and size of the step
     // it just made, read from the rows exactly as the 23rd, 24th and 30th are for p1. dp --rot2
     // gives each body its own angle; without these it starts p2 from p1's, the mirror of p2's own
     // for a mirrored UFO pair -- custom level C, a cold run's attempt 16) has p2
     // taking the -54 deg spider portal uid 464 a tick before GD.
-    if (g_cfg.dpAnchorRot2 && r.dual) {
+    if (r.dual) {
         double d2 = 0.0;
         if (const AnchorRow* prev = anchors::row(t0 - 1))
             if (prev->dual) d2 = std::remainder((double)r.rot2 - (double)prev->rot2, 360.0);
@@ -3179,7 +3266,7 @@ inline std::string anchorPayload(long long t0) {
 // (`gpbit`), which is also how the one portal it does NOT number was found --
 // a rotating gravity portal reaches the portal pass from the moving-geometry
 // side and gets no bit, so it can never appear here either.
-// cfg portalpayloadlt: `< t0`, as spentPadArg and spentOrbArg read the same hook's ticks. The
+// The payload names the portals activated before t0 (`< t0`), as spentPadArg and spentOrbArg read the same hook's ticks. The
 // activatedByPlayer hook stamps an activation with the tick BEFORE the dump row that shows its
 // effect, so `<= t0` also names a portal the attempt only reaches at t0+1. Measured on a custom
 // level (the cold run's attempt 22, anchor t0=1,042): the up-gravity portal uid 212 flips GD's
@@ -3191,11 +3278,10 @@ inline std::string anchorPayload(long long t0) {
 // reached dp as a differently spelt argument depending on the levels solved before. dp sets one
 // latch bit per uid, so the order never changed what it did.
 inline std::string portalPayload(long long t0) {
-    const bool lt = g_cfg.portalPayloadLt;
     auto spent = [&](const std::unordered_map<int, int>& seeds) {
         std::vector<int> uids;
         for (const auto& kv : seeds)
-            if (lt ? kv.second < t0 : kv.second <= t0) uids.push_back(kv.first);
+            if (kv.second < t0) uids.push_back(kv.first);
         std::sort(uids.begin(), uids.end());
         std::string out;
         for (const int u : uids) out += (out.empty() ? "" : ",") + std::to_string(u);
@@ -3275,6 +3361,20 @@ inline std::string histPayload(long long t0) {
          + ",dashRing2:" + std::to_string(r->dashRing2)
          + ",jumpBuf:" + std::to_string(r->b985)
          + ",jumpBuf2:" + std::to_string(r->b985_2);
+}
+
+// How long the button had been in the state it is in at tick t0, on the plan the game flew: dp's --startedge, the
+// start state's State::edgeAge (the run's ticks after its first, so one less than the run so far). -1 when the plan
+// never changed the button before t0 (dp then leaves it at "long ago").
+inline int edgeAgeAt(long long t0) {
+    const std::vector<InputCmd>& p = g_flownPlan.empty() ? g_plan : g_flownPlan;
+    bool down = false;
+    long long lastEdge = -1;
+    for (const InputCmd& c : p) {
+        if (c.step >= t0) break;      // plans are in step order
+        if (c.down != down) { down = c.down; lastEdge = c.step; }
+    }
+    return lastEdge < 0 ? -1 : (int)std::max<long long>(0, t0 - lastEdge - 1);
 }
 
 // The payloads joined, so a call site asks once. Any part may be absent; `owns`
@@ -4169,6 +4269,7 @@ inline int fixupPass(long long t0, const std::string& startArgStr, const std::st
                                "--shipyq", num(kYq), "--shipvq", num(kVq),
                                "--threads", kThreads};
     addStartP2dx(a, anchors::row(t0));   // dp --p2xoff
+    addStartGmod(a, anchors::row(t0));   // dp --gravtouch
     if (!band.empty()) { a.push_back("--startband"); a.push_back(band); }
     {   // ...and the touch triggers GD had already set off by t0, and the
         // gravity portals it had already spent (cfg touchpayload, off by default,
@@ -4215,32 +4316,35 @@ inline int fixupPass(long long t0, const std::string& startArgStr, const std::st
             a.push_back("--touchentered");
             a.push_back(touchEnteredArg(t0));
         }
-        // ...and, under dparg --slambox, the boxes GD fired in that attempt (recTouchArg).
-        if (solverSlamBox()) {
+        // ...and the boxes GD fired in that attempt (recTouchArg).
+        {
             a.push_back("--rectouch");
             a.push_back(recTouchArg());
         }
-        // ...and, under dparg --formularec, whose attempt the recording and the rows are (recProvArg).
-        if (solverFormulaRec()) {
+        // ...and whose attempt the recording and the rows are (recProvArg).
+        {
             a.push_back("--recprov");
             a.push_back(recProvArg());
         }
-        // ...and, under cfg dpspentpad, the pads it had already fired (spentPadArg).
-        if (g_cfg.dpSpentPad) {
+        // ...and the boxes the recording's own attempt entered (touchEnteredRows), when known.
+        if (!g_groupsTouchArg.empty()) {
+            a.push_back("--rectouchentered");
+            a.push_back(g_groupsTouchArg);
+        }
+        // ...and the pads it had already fired (spentPadArg).
+        {
             const std::string sp = spentPadArg(t0);
             if (!sp.empty()) { a.push_back("--spentpad"); a.push_back(sp); }
         }
-        // ...and the rings (spentOrbArg), and p2's under dp --spentp2 (spentOrb2Arg).
+        // ...and the rings (spentOrbArg), and p2's (spentOrb2Arg).
         {
             const std::string so = spentOrbArg(t0);
             if (!so.empty()) { a.push_back("--spentorb"); a.push_back(so); }
-            if (solverSpentP2()) {
-                const std::string so2 = spentOrb2Arg(t0);
-                if (!so2.empty()) { a.push_back("--spentorb2"); a.push_back(so2); }
-            }
+            const std::string so2 = spentOrb2Arg(t0);
+            if (!so2.empty()) { a.push_back("--spentorb2"); a.push_back(so2); }
         }
-        // ...and, under cfg dpxtrack, GD's x up to t0 (xtrackArg).
-        if (g_cfg.dpXTrack) {
+        // ...and GD's x up to t0 (xtrackArg).
+        {
             const std::string xt = xtrackArg(t0);
             if (!xt.empty()) { a.push_back("--xtrack"); a.push_back(xt); }
         }
@@ -4539,7 +4643,7 @@ inline int fixupPass(long long t0, const std::string& startArgStr, const std::st
 // before the ladder, because a record made now is used by the ladder's very first solve.
 inline void recordFixups(long long deathTick) {
     g_verifyDivT = -1;   // this death's own records only
-    if (!g_cfg.dpFixups || deathTick < 2 || g_fixupCount >= kFixupCap) return;
+    if (deathTick < 2 || g_fixupCount >= kFixupCap) return;
     phase::Scope ph("recording what the model got wrong (fixup recorder)", deathTick, g_iter);
     // ALWAYS the attempt that just died. The ladder may have been pointed at the deepest
     // attempt's trajectory instead (a rewind), and comparing the model against a run it is not
@@ -4785,6 +4889,134 @@ inline AutoWindow g_swWin;        // the wall's first window, which the probe se
 inline int g_reqSize = -1;          // the size the run keeps (0/1), -1 = none
 inline long long g_reqFrom = -1;    // ...from the kept window's head
 inline long long g_reqUntil = -1;   // ...until it is past this tick (the wall, plus the margin)
+// THE SIZE AT THE WALL, ASKED OF THE MODEL FIRST. "Keep the size from before its change" is the wrong
+// question when the change cannot be avoided and only a later portal undoes it: on a custom level's
+// ship stretch the mini portal spans the corridor (90 px tall) and a normal portal ~400 px on gives the
+// size back; every kept window (cap 100, 200, 400) found nothing, and the ladder meanwhile went back
+// 14,800 ticks to re-plan the level -- 1,754 s against 86 s for a run whose route took both portals.
+// So once the probe has crossed at the other size, every ladder search that begins before the probe's
+// window asks the model for that size ON the window's head (dp --needsize), which lets the route take
+// the unavoidable portal and the one that undoes it, and the ladder tries an anchor just before the
+// size change once, first. The kept windows remain the fallback.
+inline int g_needSize = -1;            // the size (0/1) the model is asked for, -1 = none
+inline long long g_needSizeT = -1;     // ...on this tick (the probe's window head)
+inline long long g_needSizeFrom = -1;  // the change it undoes (a forced rung kStatePad before it)
+inline long long g_needSizeUntil = -1; // ...until the run is past this tick
+inline bool g_needSizeRung = false;    // the forced rung is still owed
+
+// ---- cfg dpneedspeed: THE SPEED A WALL MAY NEED ----
+//
+// The same question as the size's, for player 1's speed, and answered the same way: by the model first. A route
+// that took an optional speed portal (or missed one) can reach a wall only another speed gets over, and the
+// ladder, which re-plans from the shallowest anchor that gets deeper, never goes back to the portal. A long
+// ship/wave level is the case: the deepest plan runs at 0.7x from the portal at x=45,315 and dies at the same wall
+// (t~30,794, x~51,800) round after round for an hour.
+//
+// A size can be swapped into the anchor (the probe, dpsecstate) because it changes nothing about when the
+// player is where. A speed cannot: a faster player is further on at the same tick and meets the moving geometry in
+// another phase, so a search from the wall's anchor with the speed swapped asks about a world no route reaches
+// (measured on that level: every speed died at the wall, and the three faster ones at the anchor's own tick).
+// So there is no probe. The question is a search from just before a speed change, with the rule that the
+// state which reaches the wall's x must not be at the speed the plan has there (dp --needspeed x:!S): if
+// such a route exists the model finds it. The plan's speed changes before the wall are asked newest
+// first, one per round of the wall's stall rule (the rule that would hand the wall to a section solve), at
+// most kSpeedTries of them; a search that does not cross the wall's x at another speed is not taken.
+constexpr long long kSpeedReach = 14000;   // how far before the wall a speed change counts
+constexpr long long kSpeedLead = 100;      // the wall's x is the plan's x this far before its death
+constexpr int kSpeedTries = 6;             // speed changes asked at one wall
+constexpr long long kSpeedPast = 2500;     // the asked search runs this far past the wall's tick
+constexpr double kSpeedCross = 30.0;       // ...and must get this far past the x to count as crossing it
+constexpr double kSpeedTakePartial = 3000.0;   // a search that DIES is taken only when it got this far past the x
+constexpr double kLaneMargin = 1000.0;     // flights in different lanes are ranked by x only when this far apart
+inline long long g_nsWall = -1;            // the wall (rungWall) the list below belongs to
+inline std::vector<long long> g_nsChanges; // the plan's speed changes before the wall, newest first
+inline size_t g_nsNext = 0;                // the next one to ask
+inline double g_needSpeedMul = 0.0;        // the speed the armed searches must not have at g_needSpeedX, 0 = none
+inline double g_needSpeedX = -1.0;         // ...the wall's x
+inline long long g_needSpeedFrom = -1;     // the change it undoes (a forced rung kStatePad before it)
+inline long long g_needSpeedUntil = -1;    // ...until the run is past this tick
+inline bool g_needSpeedRung = false;       // the forced rung is still owed
+inline double g_speedLockX = -1.0;         // the run crossed a wall in another lane here: changes before it are answered
+inline long long g_nsPinSaved = -1;        // the section solve's pin, lifted for the forced rung
+// A speed switch REPLACES the deepest plan with the model's claim that another lane gets through. The claim can be
+// false (a long ship/wave level: "SOLVED" for a lane the game kills at x=51,800, in place of a plan GD had flown to x=58,676),
+// and a replaced plan is gone. So the plan that stood is kept here, and flown again when the switched plan has
+// stopped short of it for kRetireStall rounds; if the switched plan gets past it, the kept plan is let go.
+struct RetiredBest {
+    bool active = false;
+    std::vector<InputCmd> plan;   // the plan GD flew to its deepest death before the switch
+    long long t = -1;             // ...and where that death was
+    float x = 0.f;
+    float branchX = -1.f;         // the farthest the switched plan has died since
+    int stall = 0;                // rounds since it last got 100 px farther
+};
+inline RetiredBest g_retired;
+// (the number of rounds is cfg dpretirestall, 3)
+inline std::string g_restorePlanPath;
+
+// Arm the next speed change at this wall. True = armed (the ladder that follows tries it first).
+inline bool speedArm(const char* why) {
+    if (!g_cfg.dpNeedSpeed) return false;
+    const long long wall = rungWall();
+    if (wall < 0 || g_bestDeath < 0) return false;
+    if (g_cfg.dpSecCoinRung && g_cfg.coinRoute && g_coinWall >= 0) return false;
+    // The size is asked first (cfg dpsecstate, stateFire): it is answered by the game, with a probe that costs one
+    // window, where this question costs a ladder call per speed change. A custom level has four speed changes
+    // within 2,800 ticks of its wall, which is a size wall: asked ahead of the probe, they cost it 300 s of its 120.
+    // So this waits until the size has been settled at this wall (probe said no, or no size changed, or its kept
+    // windows are spent): the wall has had its first window, and stateFire has run.
+    if (g_cfg.dpSecState) {
+        const bool sameWall = g_autoTriedWall >= 0 && wall >= g_autoTriedWall && wall < g_autoTriedWall + kAutoCreep;
+        if (!sameWall || g_swWall != g_autoTriedWall || g_swPhase != 3) return false;
+    }
+    const std::vector<AnchorRow>& v = anchors::g_deepest;
+    auto at = [&](long long t) -> const AnchorRow* {
+        return (t >= 0 && (size_t)t < v.size() && v[(size_t)t].valid) ? &v[(size_t)t] : nullptr;
+    };
+    const long long h = std::max(2LL, g_bestDeath - kSpeedLead);
+    const AnchorRow* head = at(h);
+    if (g_nsWall < 0 || wall < g_nsWall || wall >= g_nsWall + kAutoCreep) {   // a new wall: its changes
+        g_nsWall = wall;
+        g_nsChanges.clear();
+        g_nsNext = 0;
+        g_needSpeedMul = 0.0;
+        g_needSpeedRung = false;
+        if (head && head->speed > 0.5f) {
+            const long long lo = std::max(2LL, h - kSpeedReach);
+            for (long long t = h; t > lo && (int)g_nsChanges.size() < kSpeedTries; --t) {
+                const AnchorRow* r = at(t);
+                const AnchorRow* p = at(t - 1);
+                if (r && p && r->speed > 0.5f && p->speed > 0.5f && std::fabs(r->speed - p->speed) > 0.05f
+                    && (double)r->x > g_speedLockX)
+                    g_nsChanges.push_back(t);
+            }
+        }
+    }
+    if (!head || head->speed < 0.5f || g_nsNext >= g_nsChanges.size()) return false;
+    const long long ev = g_nsChanges[g_nsNext++];
+    const AnchorRow* before = at(ev - 1);
+    g_needSpeedMul = head->speed;
+    g_needSpeedX = head->x;
+    g_needSpeedFrom = ev;
+    g_needSpeedUntil = wall + g_cfg.dpSecMargin;
+    g_needSpeedRung = true;
+    char b[420];
+    snprintf(b, sizeof(b), "dpsolve:   [secspeed] %s at the wall t=%lld: player 1 runs at %.1fx at x=%.0f; its speed "
+             "change number %d back is at t=%lld (%.1fx -> %.1fx), %lld ticks before the wall - the ladder tries an "
+             "anchor just before it once, first, with no crossing of x=%.0f at %.1fx (dp --needspeed)",
+             why, wall, (double)head->speed, (double)head->x, (int)g_nsNext, ev,
+             before ? (double)before->speed : 0.0, (double)(at(ev) ? at(ev)->speed : 0.f), wall - ev,
+             (double)head->x, (double)head->speed);
+    writeResult(b);
+    // A section solve's pin makes the ladder skip every anchor before it. The forced rung starts before the speed
+    // change, and a plan from there re-solves the stretch behind the pin, so for this one rung the pin is lifted;
+    // runLadder puts it back when the rung finds no other-speed route.
+    if (g_secPin > 0) {
+        g_nsPinSaved = g_secPin;
+        g_secPin = -1;
+    }
+    return true;
+}
 
 inline void stateQueue(const AutoWindow& w, int cap, int kind, int size) {
     g_secReqStart = w.t0;
@@ -4915,6 +5147,18 @@ inline void stateAdopt(const std::vector<InputCmd>& plan, long long end, float x
 inline void stateRungDone(int kind, bool found) {
     if (kind == 1) {
         g_swPhase = found ? 2 : 3;
+        if (found) {
+            g_needSize = g_swSize;
+            g_needSizeT = g_swWin.t0;
+            g_needSizeFrom = g_swEvent;
+            g_needSizeUntil = g_swWall + g_cfg.dpSecMargin;
+            g_needSizeRung = true;
+            char b[240];
+            snprintf(b, sizeof(b), "dpsolve:   [secstate] the ladder's searches that begin before t=%lld "
+                     "now need player 1 %s there (dp --needsize), from an anchor before t=%lld first",
+                     g_needSizeT, g_needSize ? "mini" : "normal", g_needSizeFrom);
+            writeResult(b);
+        }
         writeResult(found ? "dpsolve:   [secstate] the probe crossed the wall at the other size - "
                             "the next windows begin before the size change and keep it"
                           : "dpsolve:   [secstate] the probe did not cross at the other size "
@@ -5224,6 +5468,12 @@ inline long long missedPortalTick() {
     return best;
 }
 
+// cfg dpmodelreanchor (modelReanchor below): the argv and the outcome of the call whose tail the ladder
+// spliced last, and that call's anchor.
+inline std::vector<std::string> g_mrArgs;
+inline dpbridge::SolveOutcome g_mrOutcome;
+inline long long g_mrAnchorT = -1;
+
 // ---- the ladder (runs on the worker thread) ----
 //
 // Walk anchors backwards from the death until one of them can be solved. An anchor is usable
@@ -5240,7 +5490,48 @@ inline bool runLadder(long long dt) {
         g_spentAnchors.erase(g_forceAnchorT);   // it has never been tried for THIS reason
         nForced = 1;
     }
+    const bool portalForced = nForced == 1;   // the forcing slit below rides this rung alone
+    size_t sizeRung = (size_t)-1;              // cfg dpsecstate: the rung before the size change
+    bool sizeTaken = false;                    // ...and it gave the plan
     g_forceAnchorT = -1;
+    // cfg dpsecstate: the size the wall needs, asked of the model (g_needSize above). Spent once the
+    // run is past the wall; until then the anchor before the size change is tried once, first.
+    if (g_needSize >= 0 && g_bestDeath > g_needSizeUntil) {
+        writeResult("dpsolve:   [secstate] past t=" + std::to_string(g_needSizeUntil)
+                    + " - the searches no longer need a size");
+        g_needSize = -1;
+        g_needSizeRung = false;
+    }
+    if (g_needSize >= 0 && g_needSizeRung) {
+        g_needSizeRung = false;
+        const long long at = std::max(2LL, g_needSizeFrom - kStatePad);
+        if (at < dt - kBackOff) {
+            rungs.insert(rungs.begin() + (std::ptrdiff_t)nForced, (int)(dt - at));
+            g_spentAnchors.erase(at);   // never tried for this reason
+            sizeRung = nForced;
+            ++nForced;
+        }
+    }
+    // cfg dpneedspeed: the speed the wall needs, asked of the model (speedArm above). Spent once the run is past the
+    // wall; until then the anchor before the speed change is tried once, first.
+    size_t speedRung = (size_t)-1;
+    bool speedTaken = false;
+    if (g_needSpeedMul > 0.0 && g_bestDeath > g_needSpeedUntil) {
+        writeResult("dpsolve:   [secspeed] past t=" + std::to_string(g_needSpeedUntil)
+                    + " - the searches no longer need another speed");
+        g_needSpeedMul = 0.0;
+        g_needSpeedRung = false;
+    }
+    if (g_needSpeedMul > 0.0 && g_needSpeedRung) {
+        g_needSpeedRung = false;
+        const long long at = std::max(2LL, g_needSpeedFrom - kStatePad);
+        if (at < dt - kBackOff) {
+            rungs.insert(rungs.begin() + (std::ptrdiff_t)nForced, (int)(dt - at));
+            g_spentAnchors.erase(at);   // never tried for this reason
+            speedRung = nForced;
+            ++nForced;
+        }
+    }
     // One-shot: the slit belongs to this hint's rung alone.
     const std::string forceBand = g_forcePortalBand;
     g_forcePortalBand.clear();
@@ -5265,8 +5556,8 @@ inline bool runLadder(long long dt) {
     bool tailClaimsGoal = false;   // ...and SOLVED by reaching the end, not by outliving the horizon
     size_t ckRung = (size_t)-1;   // the rung the checkpoint retries below are counting
     int ckRetries = 0;
-    int fineTries = 0;            // cfg dpfineretry: fine retries asked, this ladder
-    int pinReleases = 0;          // cfg needpinrelease: boxes released behind a pin, this ladder
+    int fineTries = 0;            // fine retries asked, this ladder
+    int pinReleases = 0;          // boxes released behind a pin, this ladder
     // Indexed rather than range-for: a rung that turns out to have been asked an unanswerable
     // question is retried once, after the question is fixed (see the needtrig drop below).
     for (size_t rungIdx = 0; rungIdx < rungs.size(); ++rungIdx) {
@@ -5318,11 +5609,11 @@ inline bool runLadder(long long dt) {
         // keeps growing). Re-anchoring there sends the search off after a route that does not
         // exist. The margin is wide because legitimate play does leave the band: verified runs
         // clear its ceiling by up to 1,083px in rotated and tower sections.
-        // cfg anchorboardarm: by the off-board credit's own test instead (config.hpp)
+        // ...by the off-board credit's own test (offBoardTick: the band counts once the player has been inside it in this
+        // attempt, a teleport disarms it, Free Mode rows are skipped), not by the raw band of the anchor's row -- GD's band
+        // survives resetLevel, so an attempt can carry the band of a later section of an earlier one.
         float offX = 0.f;
-        const bool offBoard = g_cfg.anchorBoardArm
-            ? (offBoardTick(t0, offX) >= 0)
-            : (r->pmax > r->pmin && !(r->y >= r->pmin - 1200.f && r->y <= r->pmax + 1200.f));
+        const bool offBoard = offBoardTick(t0, offX) >= 0;
         if (offBoard) {
             writeResult("dpsolve:   anchor t=" + std::to_string(t0) + " y="
                         + std::to_string((int)r->y) + " is off the board (band "
@@ -5336,9 +5627,28 @@ inline bool runLadder(long long dt) {
         std::vector<std::string> a = baseArgs(g_tailPath, (double)r->x);
         // The forcing slit rides ONLY the forced rung (the hint's re-anchor); every other
         // rung and every later solve is free to answer differently.
-        if (rungIdx < nForced && !forceBand.empty()) {
+        if (rungIdx == 0 && portalForced && !forceBand.empty()) {
             a.push_back("--deadband");
             a.push_back(forceBand);
+        }
+        // cfg dpsecstate: a search that begins before the probe's window is asked for the size there
+        if (g_needSize >= 0 && t0 < g_needSizeT) {
+            a.push_back("--needsize");
+            a.push_back(std::to_string(g_needSizeT) + ":" + std::to_string(g_needSize));
+        }
+        // cfg dpneedspeed: a search that begins before the wall's x may not cross it at the speed the plan has
+        // there; the asked one runs far enough past the wall to see it (the ladder's horizon is a few thousand
+        // ticks, and the change can be farther back than that).
+        if (g_needSpeedMul > 0.0 && (double)r->x < g_needSpeedX) {
+            a.push_back("--needspeed");
+            a.push_back(num(g_needSpeedX) + ":!" + num(g_needSpeedMul));
+            if (rungIdx == speedRung) {
+                const long long need = (dt - t0) + kSpeedPast;
+                if (need > (long long)horizonFor((double)r->x)) {
+                    a.push_back("--horizon");
+                    a.push_back(std::to_string(need));
+                }
+            }
         }
         bool rotQ = false;
         {   // 2900s the recorded run consumed before this anchor (see spentRotArg)
@@ -5361,39 +5671,48 @@ inline bool runLadder(long long dt) {
                 a.push_back("--touchentered");
                 a.push_back(touchEnteredArg(t0));
             }
-            // ...and, under dparg --slambox, the boxes GD fired in that attempt, as the resim does.
-            if (solverSlamBox()) {
+            // ...and the boxes GD fired in that attempt, as the resim does.
+            {
                 a.push_back("--rectouch");
                 a.push_back(recTouchArg());
             }
-            // ...and, under dparg --formularec, the recording's and the rows' attempts, as the resim does.
-            if (solverFormulaRec()) {
+            // ...and the recording's and the rows' attempts, as the resim does.
+            {
                 a.push_back("--recprov");
                 a.push_back(recProvArg());
             }
-            // ...and, under cfg dpspentpad, the pads it had already fired, as the resim does.
-            if (g_cfg.dpSpentPad) {
+            // ...and the boxes the recording's own attempt entered, as the resim does.
+            if (!g_groupsTouchArg.empty()) {
+                a.push_back("--rectouchentered");
+                a.push_back(g_groupsTouchArg);
+            }
+            // ...and the pads it had already fired, as the resim does.
+            {
                 const std::string sp = spentPadArg(t0);
                 if (!sp.empty()) { a.push_back("--spentpad"); a.push_back(sp); }
             }
-            // ...and the rings (p2's under dp --spentp2).
+            // ...and the rings (p2's too).
             {
                 const std::string so = spentOrbArg(t0);
                 if (!so.empty()) { a.push_back("--spentorb"); a.push_back(so); }
-                if (solverSpentP2()) {
-                    const std::string so2 = spentOrb2Arg(t0);
-                    if (!so2.empty()) { a.push_back("--spentorb2"); a.push_back(so2); }
-                }
+                const std::string so2 = spentOrb2Arg(t0);
+                if (!so2.empty()) { a.push_back("--spentorb2"); a.push_back(so2); }
             }
-            // ...and, under cfg dpxtrack, GD's x up to t0, as the resim does.
-            if (g_cfg.dpXTrack) {
+            // ...and GD's x up to t0, as the resim does.
+            {
                 const std::string xt = xtrackArg(t0);
                 if (!xt.empty()) { a.push_back("--xtrack"); a.push_back(xt); }
             }
         }
         a.push_back("--start");
         a.push_back(arg);
+        // ...and how long the button had been as it is, so the wave's button floor holds across the join.
+        if (g_cfg.wavePulse > 1 && !g_waveRelaxed) {
+            const int ea = edgeAgeAt(t0);
+            if (ea >= 0) { a.push_back("--startedge"); a.push_back(std::to_string(ea)); }
+        }
         addStartP2dx(a, r);   // dp --p2xoff
+        addStartGmod(a, r);   // dp --gravtouch
         // ...and the coins GD had already credited by t0 (AnchorRow::coins).
         const std::string coinMask = g_cfg.coinRoute ? std::to_string(r->coins) : "";
         if (!coinMask.empty()) { a.push_back("--coinmask"); a.push_back(coinMask); }
@@ -5531,6 +5850,29 @@ inline bool runLadder(long long dt) {
                 // ended). The depth bar alone carries the claim.
                 || (restartScale && o.verdict == dpbridge::OutcomePartial
                     && o.deepT > 0 && o.deepX > (double)g_hudVerifiedX + 40.0));
+        // cfg dpneedspeed: the asked search is taken only if it got past the wall's x -- at another speed, which the
+        // rule it carries makes the only way. A forced rung's usual exemption (any PARTIAL) would splice a route that
+        // died AT that x, and put it in place of the deepest plan.
+        if (rungIdx == speedRung) {
+            usable = haveFile && !cand.empty()
+                     && (o.verdict == dpbridge::OutcomeSolved
+                         || (o.verdict == dpbridge::OutcomePartial && o.deepX > g_needSpeedX + kSpeedTakePartial));
+            // ...and a search that dies a little past the wall is not a route. A long ship/wave level, a run planning shorter
+            // horizons: the fast lane stood at x=58,676, the other lane's search "got to" x=60,022 and was taken in
+            // its place; the game killed that lane at x=51,800 as it always had, and the proven fast-lane plan was
+            // gone. The model's claim that a lane gets through is worth the replacement only when it gets far.
+            char sb[300];
+            snprintf(sb, sizeof(sb), "dpsolve:   [secspeed] the search from t=%lld (x=%.0f), no crossing of x=%.0f at "
+                     "%.1fx: %s to t=%lld x=%.0f - %s", t0, (double)r->x, g_needSpeedX, g_needSpeedMul,
+                     o.verdict == dpbridge::OutcomeSolved ? "SOLVED" : (o.verdict == dpbridge::OutcomePartial
+                                                                           ? "PARTIAL" : "FAILED"),
+                     o.deepT, o.deepX,
+                     usable ? "taken" : "no route at another speed from this change");
+            writeResult(sb);
+            // The pin lifted for this rung (speedArm) goes back unless the rung's plan replaces what stood behind it.
+            if (!usable && g_secPin < 0 && g_nsPinSaved > 0) g_secPin = g_nsPinSaved;
+            g_nsPinSaved = -1;
+        }
         // 280 before resimdie was added, 352 before the killer was added to it;
         // snprintf truncates rather than overflows, but a truncated line would
         // silently drop the "- doomed" tail, which is the half a reader acts on.
@@ -5614,7 +5956,7 @@ inline bool runLadder(long long dt) {
         // that cannot be met from here -- drop the box and let the ladder ask again.
         const unsigned long long stuckBoxes =
             o.needTrigMask & o.needTrigPassed & ~g_needTrigDropped;
-        // cfg needpinrelease: ...at once, when a section-solve pin stands behind the anchor. The
+        // ...at once, when a section-solve pin stands behind the anchor. The
         // release below waits for "the run stops getting anywhere" so that the empty frontier can
         // push the ladder back to an anchor before the box -- but the ladder never anchors before
         // a pin, so behind one that push has nowhere to go, and dpsecauto hands the wall to a
@@ -5623,7 +5965,7 @@ inline bool runLadder(long long dt) {
         // re-flew one plan into t=9,674 for ten rounds between section solves that found nothing,
         // and the search with the box dropped went on to t=11,871 -- a plan the game then flew
         // to t=12,000. Retries the rung, a bounded number of times per ladder.
-        if (g_cfg.needPinRelease && !usable && stuckBoxes && o.deepT <= 0 && g_secPin > 0
+        if (!usable && stuckBoxes && o.deepT <= 0 && g_secPin > 0
             && g_secPin < t0 && pinReleases < 8) {
             ++pinReleases;
             g_needTrigDropped |= stuckBoxes;
@@ -5661,7 +6003,7 @@ inline bool runLadder(long long dt) {
                      "anywhere", aheadBoxes);
             writeResult(b);
         }
-        // cfg dpfineretry: THE CORRIDOR NARROWER THAN A BIN. A doomed PARTIAL with no cap hit says
+        // THE CORRIDOR NARROWER THAN A BIN. A doomed PARTIAL with no cap hit says
         // the search kept every cell it made and still lost the route -- and in ship / UFO a cell is
         // the flying modes' coarse dedupe bin (--shipyq / --shipvq), so two states a bin apart are one
         // cell and the keeper may be the one that dies. Asked once more over a short window with fine
@@ -5674,7 +6016,7 @@ inline bool runLadder(long long dt) {
         // with --shipyq 2 --shipvq 10 --inputgrid 1 --cap 50000 over 400 ticks the frontier lives to
         // the horizon in 12.5 s; with the fine bins but the grid kept it dies at 311 (the route needs
         // a one-tick press on an odd tick), and with the grid lifted but coarse bins at 277.
-        if (!usable && g_cfg.dpFineRetry && haveFile && o.verdict == dpbridge::OutcomePartial
+        if (!usable && haveFile && o.verdict == dpbridge::OutcomePartial
             && o.capHits == 0 && o.deepT > t0 && fineTries < kFineTriesPerLadder) {
             const AnchorRow* dr = anchors::row(dt);
             if (!dr) dr = anchors::row(dt - 1);
@@ -5722,6 +6064,22 @@ inline bool runLadder(long long dt) {
         tail = std::move(cand);
         chosenT = t0;
         chosenBackoff = bo;
+        // cfg dpsecstate: the model answered the size decision; the kept windows (which keep the
+        // size from before the change, and fly the deepest plan at the old size in between) are not
+        // asked at this wall.
+        if (rungIdx == sizeRung && g_swPhase == 2) {
+            g_swPhase = 3;
+            sizeTaken = true;
+            writeResult("dpsolve:   [secstate] the search from before the size change gave a plan at "
+                        "the size the wall needs - no kept windows at this wall");
+        }
+        // cfg dpneedspeed: ...and the one from before the speed change gave a plan at another speed
+        if (rungIdx == speedRung) speedTaken = true;
+        // cfg dpmodelreanchor: the call behind the chosen tail, for a replay of the spliced plan from
+        // the same anchor (modelReanchor)
+        g_mrArgs = a;
+        g_mrOutcome = o;
+        g_mrAnchorT = t0;
         // KEEP THE TAIL, next to the splice that is about to consume it. Once it
         // is merged into the plan its own ticks are gone, and the next question
         // about a doomed plan -- whether the tail solver's anchor->global tick
@@ -5799,7 +6157,170 @@ inline bool runLadder(long long dt) {
     snprintf(b, sizeof(b), "dpsolve:   re-anchored at t=%lld (backoff %d): %zu kept + %zu new "
              "= %zu inputs", chosenT, chosenBackoff, nPrefix, tail.size(), g_plan.size());
     writeResult(b);
+    // cfg dpsecstate: the deepest plan kept the size the probe showed the wall will not let through,
+    // so it is not the plan to go back to (as stateAdopt). The new one is verified to its anchor; the
+    // next flight that gets further is an ordinary improvement, and the section windows stop drawing
+    // their prefix from the old size's plan (measured: three rounds flew it back to the old wall).
+    if (sizeTaken || speedTaken) {
+        snprintf(b, sizeof(b), "dpsolve:   [%s] the plan from before the %s change replaces the "
+                 "deepest plan: the depth to beat goes %lld -> %lld", sizeTaken ? "secstate" : "secspeed",
+                 sizeTaken ? "size" : "speed", g_bestDeath, chosenT);
+        writeResult(b);
+        // cfg dpneedspeed: the plan that stood is kept, to be flown again if the switch does not get past it. A
+        // second switch while one is out keeps the first: that plan is the one GD proved.
+        if (speedTaken && !sizeTaken && g_cfg.dpNeedSpeed && !g_retired.active && g_bestDeath >= 0) {
+            g_retired = RetiredBest{true, g_best, g_bestDeath, g_bestDeathX, -1.f, 0};
+            snprintf(b, sizeof(b), "dpsolve:   [secspeed] the plan GD flew to t=%lld x=%.0f is kept: flown again if the "
+                     "switched plan is still short of it after %d rounds without getting 100 px farther",
+                     g_bestDeath, (double)g_bestDeathX, g_cfg.dpRetireStall);
+            writeResult(b);
+        }
+        g_best = g_plan;
+        g_bestDeath = chosenT;
+        g_bestDeathX = g_anchorX;
+        g_spentAnchors.clear();
+    }
     return true;
+}
+
+// cfg dpmodelreanchor: RE-ANCHOR ON THE MODEL'S OWN STATE BEFORE THE GAME SEES THE PLAN. The tail
+// the ladder just spliced was searched from the game's anchor, and its witness walk (the search
+// call's own replay of it) can die of physics short of where the search believed it went. Flying it
+// then costs an attempt to learn what the model already says. Instead: replay the spliced plan from
+// the same anchor through dp, write the model's state a rung before that death (dp --dumpstate),
+// and search again from that state (--start-state) -- the state crosses whole, the rings, the
+// triggers' fire state and the moving geometry included, which an anchor built from the game's
+// recording cannot carry. A tail that gets past the death is spliced on at the rung, and the walk of
+// the new call is asked the same question, up to the cfg value's number of times. Nothing changes
+// when the walk is clean, the death is a rule or a prune rather than physics, or no rung helps.
+// The rungs are --resimladder's (dp re-searches inside one call from 6/24/96/240 ticks before).
+inline void modelReanchor() {
+    static constexpr int kMrRungs[] = {6, 24, 96, 240};
+    std::error_code ec;
+    const std::string dir = std::string(DATA_DIR) + "/";
+    const std::string planF = dir + "dp_mr_plan.txt";
+    const std::string replayOut = dir + "dp_mr_replay";
+    long long anchorT = g_mrAnchorT;
+    auto withArg = [](std::vector<std::string> a, const std::string& flag, const std::string& v) {
+        for (size_t i = 0; i + 1 < a.size(); ++i)
+            if (a[i] == flag) { a[i + 1] = v; return a; }
+        a.push_back(flag);
+        a.push_back(v);
+        return a;
+    };
+    char b[384];
+    for (int it = 1; it <= g_cfg.dpModelReanchor; ++it) {
+        const dpbridge::SolveOutcome& o = g_mrOutcome;
+        const bool usableVerdict = o.verdict == dpbridge::OutcomeSolved
+                                || o.verdict == dpbridge::OutcomePartial;
+        if (!usableVerdict || o.resimDead <= 0 || o.resimFirst <= anchorT) return;
+        const long long tm = o.resimFirst;
+        if (o.resimKind != 0) {   // step.hpp kDeathPhysics
+            snprintf(b, sizeof(b), "dpsolve:   [mr] the walk dies at t=%lld of %s, not physics (kind %d) "
+                     "- left to the game", tm, o.resimWhy ? o.resimWhy : "?", o.resimKind);
+            writeResult(b);
+            return;
+        }
+        // A PARTIAL's walk dies where its frontier did; only one that dies short of it is the model
+        // contradicting its own search.
+        if (o.verdict == dpbridge::OutcomePartial && tm + kMrRungs[0] >= o.deepT) return;
+        snprintf(b, sizeof(b), "dpsolve:   [mr] round %d: the walk from t=%lld dies at t=%lld (%s, uid %d) "
+                 "- %s reached t=%lld", it, anchorT, tm, o.resimWhy ? o.resimWhy : "?", o.resimUid,
+                 o.verdict == dpbridge::OutcomeSolved ? "SOLVED" : "PARTIAL", o.deepT);
+        writeResult(b);
+        if (!writeInputsFile(planF, g_plan)) {
+            writeResult("dpsolve:   [mr] could not write " + planF + " - stopping");
+            return;
+        }
+        bool advanced = false;
+        // The replay of the plan is what the state is dumped from, and it can die before the search's
+        // walk did (measured on lv22: the walk turned the gameplay at a 2900 the replay never fires, and
+        // flew 400 ticks further). Then the rungs are counted from the replay's death instead, once.
+        long long tm2 = tm;
+        bool retargeted = false;
+        for (size_t ri = 0; ri < std::size(kMrRungs); ++ri) {
+            const int bo = kMrRungs[ri];
+            const long long ts = tm2 - bo;
+            if (ts <= anchorT) break;
+            const std::string stateF = dir + "dp_mr_it" + std::to_string(g_iter) + "_r"
+                                     + std::to_string(it) + "_t" + std::to_string(ts) + ".state";
+            std::vector<std::string> ra = withArg(g_mrArgs, "--out", replayOut);
+            ra.push_back("--replay");
+            ra.push_back(planF);
+            ra.push_back("--dumpstate");
+            ra.push_back(std::to_string(ts) + ":" + stateF);
+            std::filesystem::remove(stateF, ec);
+            const int rrc = timedSolve(g_csv, ra, "mrdump");
+            const dpbridge::SolveOutcome ro = dpbridge::outcome();
+            if (ro.dumpT != ts || ro.dumpStart.empty() || !std::filesystem::exists(stateF, ec)) {
+                const bool retarget = !retargeted && ro.replayDiedT > anchorT && ro.replayDiedT <= ts;
+                snprintf(b, sizeof(b), "dpsolve:   [mr]   t=%lld: the replay wrote no state (rc=%d, it "
+                         "died at t=%lld) - %s", ts, rrc, ro.replayDiedT,
+                         retarget ? "the rungs count from the replay's death" : "next rung");
+                writeResult(b);
+                if (retarget) {
+                    retargeted = true;
+                    tm2 = ro.replayDiedT;
+                    ri = (size_t)-1;   // the ++ brings it to the first rung
+                }
+                continue;
+            }
+            std::vector<std::string> sa = withArg(g_mrArgs, "--start", ro.dumpStart);
+            sa = withArg(sa, "--start-state", stateF);
+            std::filesystem::remove(g_tailPath, ec);
+            logSolverArgs(sa);
+            const int src = timedSolve(g_csv, sa, "mranchor");
+            const dpbridge::SolveOutcome so = dpbridge::outcome();
+            std::vector<InputCmd> tail;
+            const bool have = std::filesystem::exists(g_tailPath, ec)
+                           && loadInputsFile(g_tailPath, tail, true);
+            const long long newDeath = so.resimDead > 0 ? so.resimFirst
+                                                       : std::numeric_limits<long long>::max();
+            const bool applied = so.startStateT == ts;
+            const bool usable = have && applied && newDeath > tm2
+                && (so.verdict == dpbridge::OutcomeSolved
+                    || (so.verdict == dpbridge::OutcomePartial && so.deepT > tm2));
+            snprintf(b, sizeof(b), "dpsolve:   [mr]   t=%lld (rung %d, replay died t=%lld): rc=%d %s t=%lld "
+                     "walk %s%s%s", ts, bo, ro.replayDiedT, src,
+                     so.verdict == dpbridge::OutcomeSolved
+                         ? (so.horizonCut ? "SOLVED(horizon)" : "SOLVED")
+                         : (so.verdict == dpbridge::OutcomePartial ? "PARTIAL" : "FAILED"),
+                     so.deepT,
+                     so.resimDead > 0 ? ("dies t=" + std::to_string(so.resimFirst)).c_str() : "clean",
+                     applied ? "" : " (STATE NOT APPLIED)",
+                     usable ? " - taken" : "");
+            writeResult(b);
+            if (!usable) continue;
+            std::vector<InputCmd> next;
+            for (const InputCmd& c : g_plan) {
+                if (c.step >= ts) break;
+                next.push_back(c);
+            }
+            const size_t nPrefix = next.size();
+            next.insert(next.end(), tail.begin(), tail.end());
+            g_plan.swap(next);
+            g_lastTailSolved = so.verdict == dpbridge::OutcomeSolved;
+            g_planClaimsGoal = g_lastTailSolved && !so.horizonCut;
+            {
+                char tp[512];
+                snprintf(tp, sizeof(tp), "%s/dp_tail_it%d_mr%lld.txt", DATA_DIR, g_iter, ts);
+                writeInputsFile(tp, tail);
+            }
+            snprintf(b, sizeof(b), "dpsolve:   [mr] re-anchored on the model at t=%lld: %zu kept + %zu new "
+                     "= %zu inputs", ts, nPrefix, tail.size(), g_plan.size());
+            writeResult(b);
+            g_mrArgs = sa;
+            g_mrOutcome = so;
+            anchorT = ts;
+            advanced = true;
+            break;
+        }
+        if (!advanced) {
+            writeResult("dpsolve:   [mr] no rung got past t=" + std::to_string(tm2)
+                        + " - the plan goes to the game as it is");
+            return;
+        }
+    }
 }
 
 // The fingerprint of a plan, in ONE place. The [fp] line signs the plan GD flew
@@ -5840,7 +6361,9 @@ inline std::string planFnv(const std::vector<InputCmd>& p) {
 // an earlier run's dp_plan.txt/dp_best.txt or a saved solution_lvN_dp.txt. If GD does not reach at
 // least as far with it as the seed's own history says it should, that is itself a finding (the
 // level, the mod, or the seed changed) and the run proceeds from wherever GD actually put it.
-enum JobKind { JobFirstSolve = 0, JobLadder = 1, JobSeedPlan = 2 };
+// JobRestorePlan: the same as JobSeedPlan in the middle of a run -- g_restorePlanPath (the plan a speed switch replaced,
+// RetiredBest) is installed for the game to fly again, and it claims nothing.
+enum JobKind { JobFirstSolve = 0, JobLadder = 1, JobSeedPlan = 2, JobRestorePlan = 3 };
 
 // A job that finishes after its session has ended -- the player stopped the Solve or left the level, or a
 // give-up ended it, while a search was out. poll() takes a result only in the frames of a live session,
@@ -5975,6 +6498,10 @@ inline void spawn(int kind, long long arg, const char* phase) {
                 // A seeded plan is somebody else's claim; the game is about to
                 // test it, so treat it as claiming the goal.
                 g_planClaimsGoal = ok;
+            } else if (kind == JobRestorePlan) {
+                g_rc = 0;
+                ok = loadInputsFile(g_restorePlanPath, g_plan, true);
+                g_planClaimsGoal = false;   // a plan that already died; the game flies it to be told where
             } else {
                 // Put the plan GD just replayed on disk. The fixup resim runs it through the
                 // model with `--replay`, and the file is the only way to hand it over -- while
@@ -6076,6 +6603,8 @@ inline void spawn(int kind, long long arg, const char* phase) {
                 } else {
                     g_autoRecordThenRung = false;
                     ok = runLadder(arg);
+                    // cfg dpmodelreanchor: the plan's own walk dies -> re-anchor on the model's state
+                    if (ok && g_cfg.dpModelReanchor > 0) modelReanchor();
                 }
             }
         } catch (...) {
@@ -6298,9 +6827,14 @@ inline void start(GJBaseGameLayer* l) {
         writeResult("dprun: begin level=" + std::to_string(g_cfg.levelId) + " seed="
                     + std::to_string(g_cfg.dpSeed));
     }
-    std::ostringstream oss;
-    solver::writeObjRects(oss, l);
-    g_csv = oss.str();
+    // The level table. In the reset that built the POIs it was already made, for objrects.txt, from the same
+    // objects in the same state (nothing runs between the two), and is taken from there; any other start makes it.
+    if (solver::g_objRectsLayer == l && !solver::g_objRectsText.empty()) {
+        g_csv = std::move(solver::g_objRectsText);
+        solver::forgetObjRectsText();
+    } else {
+        g_csv = solver::objRectsText(l);
+    }
     g_csvSig = bytesSig(g_csv);
     // A level the solver cannot represent is refused HERE, before any search, the way a
     // platformer is. It used to be found inside the first solve, where the loader called
@@ -6334,10 +6868,9 @@ inline void start(GJBaseGameLayer* l) {
     // always run. Set here, before any solve is spawned: dp reads it once per call.
     dpbridge::checkSubscribe(g_cfg.dpCheck);
     dpbridge::cancelSearch(false);
-    // cfg dpplainbeside when it is given, else the settings menu's "Solve faster" (the gamble).
-    // Read here, on the game's thread, once for the session.
-    const int menuMode = Mod::get()->getSettingValue<bool>("solve-gamble") ? 3 : 0;
-    g_plainBesideMode = g_cfg.dpPlainBeside >= 0 ? g_cfg.dpPlainBeside : menuMode;
+    // cfg dpplainbeside when it is given (3 is the gamble, which used to be the setting "Solve faster (not reproducible)"
+    // and is now cfg only), else the plain default. Read here, once for the session.
+    g_plainBesideMode = g_cfg.dpPlainBeside >= 0 ? g_cfg.dpPlainBeside : 0;
     if (g_plainBesideMode == 3)
         writeResult("dpsolve: solving under the gamble (dpplainbeside=3): the plain search is "
                     "taken as soon as it will do, so this run is not reproducible");
@@ -6396,6 +6929,7 @@ inline void start(GJBaseGameLayer* l) {
     }
     g_groupsDepth = -1;
     g_groupsSerial = -1;
+    g_groupsTouchArg.clear();
     g_groupsCopiedSig.clear();
     g_fixinGroupsBySig.clear();
     g_fixinPending = false;
@@ -6413,6 +6947,9 @@ inline void start(GJBaseGameLayer* l) {
     g_recordKind = RecNone;
     g_recordRequest = false;
     g_coldRestarted = false;
+    g_waveRelaxed = false;
+    g_glitchStage = 0;
+    g_waveRelaxedX = -1.f;
     g_escalations = 0;
     g_capTier = 0;
     g_topTierIter = 0;
@@ -6535,6 +7072,19 @@ inline void start(GJBaseGameLayer* l) {
     g_reqSize = -1;
     g_reqFrom = -1;
     g_reqUntil = -1;
+    g_needSize = -1;         // ...and the size asked of the model
+    g_needSizeT = g_needSizeFrom = g_needSizeUntil = -1;
+    g_needSizeRung = false;
+    g_nsWall = -1;           // cfg dpneedspeed
+    g_nsChanges.clear();
+    g_nsNext = 0;
+    g_needSpeedMul = 0.0;
+    g_needSpeedX = -1.0;
+    g_needSpeedFrom = g_needSpeedUntil = -1;
+    g_needSpeedRung = false;
+    g_speedLockX = -1.0;
+    g_nsPinSaved = -1;
+    g_retired = RetiredBest{};
     g_lastDeath = -1;
     g_coinMissPending = false;
     g_lastDeathCoinMiss = false;
@@ -6922,6 +7472,8 @@ inline void harvestGroups(bool fresh = true) {
     if (!copyRecording(std::string(DATA_DIR) + "/grouptrace_last.txt", g_groupsPath)) return;
     g_groupsDepth = r.depth;
     g_groupsSerial = g_attemptSerial;   // grouptrace_last is the attempt that just ended
+    g_groupsTouchArg = fresh ? touchEnteredRows(v, &anchors::g_seedsDead.touchFire)   // ...and the boxes it entered
+                             : std::string();
     if (g_cfg.groupsRetime) {
         g_groupsX.assign(v.size(), std::numeric_limits<float>::quiet_NaN());
         if (fresh)
@@ -7963,7 +8515,19 @@ inline void onDeath(long long dt, float deathX) {
     // meaningful, never completing -- the overlong guard ends it at 40k ticks) is
     // wedge-class for every purpose: never ranks, counts toward the veto, re-arms the
     // portal hint. No legitimate attempt exceeds ~22k ticks on these levels.
-    if (dt > 30000) wasWedged = true;
+    //
+    // cfg stallbound: ...except on a level that is longer than that. The guard's own bound (hooks_gamelayer) is the
+    // longer of 40,000 and the level's length at the slowest speed, and 30,000 is three quarters of the 40,000: this
+    // is the same three quarters of the bound the guard uses. A long ship/wave level (84,333 px) lives at 0.7x for 30,000+ ticks,
+    // so every death it ever had past t=30,000 -- the slow lane's wall at 30,794 and the fast lane's at 30,594 alike --
+    // was read as a wedge and never ranked: the run's "best" sat at t=29,553 while the plans died 1,200 ticks and
+    // 7,000 px beyond it.
+    long long wedgeT = 30000;
+    if (g_cfg.stallBound)
+        if (auto* plw = PlayLayer::get())
+            wedgeT = std::max<long long>(30000, (long long)(0.75 * (double)std::max<long long>(
+                                         40000, (long long)((double)plw->m_levelLength / 0.9) + 4000)));
+    if (dt > wedgeT) wasWedged = true;
     // The HUD's iteration block is fed by the external driver through hud.txt. There is no
     // driver here, so the loop fills the same fields itself -- otherwise the panel's Solve mode
     // sits on "iter 0 starting" for the whole run
@@ -7973,6 +8537,21 @@ inline void onDeath(long long dt, float deathX) {
     snprintf(b, sizeof(b), "dpsolve: iter %d: death t=%lld x=%.1f (best t=%lld)",
              g_iter, dt, (double)deathX, g_bestDeath);
     writeResult(b);
+    // ...and Avoid glitches comes back a step per kWaveRelaxSpan px, not all at once: on a level that is nothing but
+    // hairline passes the next wall would find the full margins again, and each wall costs rounds. The wave's
+    // behaviour returns with the last step.
+    if ((g_waveRelaxed || g_glitchStage > 0) && g_waveRelaxedX >= 0.f && deathX > g_waveRelaxedX + kWaveRelaxSpan) {
+        if (g_glitchStage > 0) --g_glitchStage;
+        if (g_glitchStage == 0) {
+            g_waveRelaxed = false;
+            g_waveRelaxedX = -1.f;
+            writeResult("dpsolve:   past that stretch - Avoid glitches is back as chosen");
+        } else {
+            g_waveRelaxedX = deathX;
+            writeResult(std::string("dpsolve:   past that stretch - Avoid glitches' margins come back one step (")
+                        + (g_glitchStage == 1 ? "halved" : "quartered") + ")");
+        }
+    }
     // THE PLAN GD JUST FLEW, kept before anything can replace it. The rewind
     // below sets `g_plan = g_best`, and the fixup recorder's resim reads the file
     // written AFTER that -- so without this the model side of every fixup a
@@ -8132,7 +8711,61 @@ inline void onDeath(long long dt, float deathX) {
             writeResult(cb);
         }
     }
-    const bool deeper = (dt > g_bestDeath || coinOver >= 0) && !wasWedged;
+    // cfg voidband x wedge: a run over empty floor that also wedges (it crossed a mode portal in the wrong mode and
+    // ran on) never ranks, so closing it left the depth to beat where it was and the loop rewound past the ground
+    // the plan had flown in the lane before it dropped: a custom level's plan crosses its wall at t=29,555-30,808
+    // and falls to the floor at t=30,587, and the rewind gave that away (best 29,007). GD flew the plan alive to
+    // the run's first tick, so that tick is a depth like any death's (voidDeeper below sets it).
+    const bool voidCredit = g_cfg.voidBand && g_cfg.voidCredit && wasWedged && g_voidDt == dt && g_voidT0 > g_bestDeath;
+    // cfg dpneedspeed: two flights that were at different speeds at the same x are not ranked by tick. A faster lane is
+    // at the same x sooner (a long ship/wave level: x=57,930 at t=30,281 in the fast lane, x=51,800 at t=30,793 in the slow one),
+    // and a rank by tick calls the slow lane's wall the deepest and the fast lane's progress a regression. Where the
+    // lanes differ the farther flight is the deeper one (laneDir +1 / -1); where they do not, the tick decides as ever.
+    // The lane is read where both flights are: 100 px before the nearer death.
+    int laneDir = 0;
+    if (g_cfg.dpNeedSpeed && !wasWedged && g_bestDeath >= 0 && g_bestDeathX > 0.f) {
+        const double xr = std::min((double)deathX, (double)g_bestDeathX) - 100.0;
+        // x is the progress only on ground where it only grows: over the stretch both flights cover (xr to the nearer
+        // death) each must be in upright gameplay (gframe 0) and never go back (a rotated section, a teleport).
+        // Official lv22 nocoin, x=2,891..3,228: a 1.3x flight 237 px short of a 0.9x one was called not deeper in a
+        // rotated stretch, and the loop spent five rounds on the wrong one.
+        const double xEnd = std::min((double)deathX, (double)g_bestDeathX) + 1.0;
+        float speedNew = 0.f, speedOld = 0.f;
+        auto laneAt = [&](const std::vector<AnchorRow>& v, float& speed) -> bool {
+            bool on = false;
+            float hi = 0.f;
+            for (size_t k = 2; k < v.size(); ++k) {
+                if (!v[k].valid) continue;
+                if (!on) {
+                    if ((double)v[k].x < xr) continue;
+                    on = true;
+                    speed = v[k].speed;
+                }
+                if ((double)v[k].x > xEnd) break;
+                if (v[k].gframe != 0 || v[k].x < hi - 30.f) return false;
+                hi = std::max(hi, v[k].x);
+            }
+            return on;
+        };
+        const bool laneOk = laneAt(anchors::g_dead, speedNew) && laneAt(anchors::g_deepest, speedOld);
+        const float sNew = laneOk ? speedNew : 0.f, sOld = laneOk ? speedOld : 0.f;
+        if (sNew > 0.5f && sOld > 0.5f && std::fabs(sNew - sOld) > 0.05f) {
+            // ...and only when they are far apart. Official lv22 nocoin: a 1.3x flight that died at x=3,228 and a
+            // 0.9x one at x=2,991 (237 px) are not a lane's lead -- the 0.9x one was the way on, found by the tick
+            // ranking, and the x ranking sent the loop five rounds into the dead end of the other. That level's lanes
+            // are 1,900 to 12,000 px apart.
+            if ((double)deathX > (double)g_bestDeathX + kLaneMargin) laneDir = 1;
+            else if ((double)deathX < (double)g_bestDeathX - kLaneMargin) laneDir = -1;
+            char sb2[300];
+            snprintf(sb2, sizeof(sb2), "dpsolve:   [secspeed] this flight was at %.1fx at x=%.0f and the deepest plan at %.1fx: "
+                     "t=%lld x=%.0f against t=%lld x=%.0f - ranked by x, %s", (double)sNew, xr, (double)sOld, dt,
+                     (double)deathX, g_bestDeath, (double)g_bestDeathX,
+                     laneDir > 0 ? "deeper" : (laneDir < 0 ? "not deeper" : "level"));
+            writeResult(sb2);
+        }
+    }
+    const bool tickDeeper = laneDir == 0 ? dt > g_bestDeath : laneDir > 0;
+    const bool deeper = (tickDeeper || coinOver >= 0 || voidCredit) && (!wasWedged || voidCredit);
     // cfg dptopstop: the same stop, reached by the search sitting at its largest capacity without
     // getting deeper. Only going deeper takes the ladder back down (the first branch below), so a
     // round that is about to do that is let through.
@@ -8185,6 +8818,16 @@ inline void onDeath(long long dt, float deathX) {
             g_horizonNow = horizonDefault();
         }
         g_triedWholeLevel = false;   // a new wall gets its own whole-level try (step mode)
+        // cfg dpneedspeed: the run is past the wall the previous deepest plan stopped at, by another lane. The speed
+        // changes behind that wall are answered (this lane is the answer) and are not asked again at the walls ahead:
+        // asking the new lane's wall to leave the lane puts the run back in front of the old one.
+        if (laneDir > 0) {
+            g_speedLockX = std::max(g_speedLockX, (double)g_bestDeathX);
+            g_needSpeedMul = 0.0;
+            g_needSpeedRung = false;
+            writeResult("dpsolve:   [secspeed] crossed the old wall (x=" + std::to_string((long long)g_bestDeathX)
+                        + ") in another lane: the speed changes up to there are not asked again");
+        }
         g_bestDeath = dt;
         g_bestDeathX = deathX;
         if (g_voidDt == dt) voidDeeper("is");   // cfg voidband: this death closed its run
@@ -8290,7 +8933,7 @@ inline void onDeath(long long dt, float deathX) {
         // Getting nowhere. Two things are worth trying, in the order of what they cost, and
         // both are things the loop can tell it needs from the run itself rather than from a
         // table of levels.
-        if (g_stallRuns >= kStallToUnseen && !g_needUnseen && g_cfg.dpWorld) {
+        if (g_stallRuns >= kStallToUnseen && !g_needUnseen) {
             g_needUnseen = true;
             writeResult("dpsolve:   stuck - from here the search must also enter the doors "
                         "whose effect it has not seen");
@@ -8351,8 +8994,16 @@ inline void onDeath(long long dt, float deathX) {
         const bool sameWall = (outcome != itermap::KindDeeper) && g_lastDeath >= 0
                               && std::llabs(dt - g_lastDeath) <= 8;
         g_wallRepeats = sameWall ? g_wallRepeats + 1 : 0;
-        const int want = (ran < g_cfg.dpStepHorizon && g_wallRepeats < 2) ? g_cfg.dpStepHorizon
-                                                                            : g_horizonFull;
+        int want = (ran < g_cfg.dpStepHorizon && g_wallRepeats < 2) ? g_cfg.dpStepHorizon
+                                                                      : g_horizonFull;
+        // cfg dphorizongrow: the model was right as far as the game flew; ask for that far again (a percent of it),
+        // not for the level, and never more than dphorizonmax. The second stop at one wall still asks for the
+        // whole level (above).
+        if (g_cfg.dpHorizonGrow >= 100 && g_horizonFull >= g_cfg.dpHorizonGrowMin && want == g_horizonFull && g_wallRepeats < 2) {
+            long long grown = std::max<long long>(g_cfg.dpStepHorizon, ran * g_cfg.dpHorizonGrow / 100);
+            if (g_cfg.dpHorizonMax > 0) grown = std::min<long long>(grown, std::max(g_cfg.dpHorizonMax, g_cfg.dpStepHorizon));
+            want = (int)std::min<long long>(g_horizonFull, grown);
+        }
         // cfg dpcontenthorizon: the second stop at one wall asks for the whole level on purpose.
         g_horizonFullAsked = g_wallRepeats >= 2;
         if (want != g_horizonNow) {
@@ -8409,6 +9060,40 @@ inline void onDeath(long long dt, float deathX) {
             g_coinWallPlan.clear();
         }
     }
+    // cfg dpneedspeed: the plan a speed switch replaced (RetiredBest). A switched plan that gets past it has made
+    // it redundant; one that stands short of it, round after round, was the model's mistake, and the plan GD proved
+    // is flown again -- from its own death, as a new deepest, with the speed question at its wall spent.
+    if (g_retired.active && !wasWedged) {
+        if ((float)deathX > g_retired.branchX + 100.f) { g_retired.branchX = deathX; g_retired.stall = 0; }
+        else ++g_retired.stall;
+        if ((double)deathX > (double)g_retired.x + kSpeedCross) {
+            snprintf(b, sizeof(b), "dpsolve:   [secspeed] the switched plan reached x=%.0f, past the kept plan's x=%.0f "
+                     "(t=%lld): the kept plan is let go", (double)deathX, (double)g_retired.x, g_retired.t);
+            writeResult(b);
+            g_retired = RetiredBest{};
+        } else if (g_retired.stall >= g_cfg.dpRetireStall && (double)g_retired.branchX < (double)g_retired.x - kLaneMargin) {
+            snprintf(b, sizeof(b), "dpsolve:   [secspeed] the switched plan stands at x=%.0f after %d rounds, short of the "
+                     "plan it replaced (x=%.0f, t=%lld): that plan is flown again", (double)g_retired.branchX,
+                     g_retired.stall, (double)g_retired.x, g_retired.t);
+            writeResult(b);
+            g_restorePlanPath = std::string(DATA_DIR) + "/dp_restore_plan.txt";
+            writeInputsFile(g_restorePlanPath, g_retired.plan);
+            g_plan = g_retired.plan;
+            g_best = g_retired.plan;
+            g_bestDeath = -1;           // its death, flown again, is a new deepest (keepAsDeepest takes the rows)
+            g_bestDeathX = 0.f;
+            g_spentAnchors.clear();
+            g_stallRuns = 0;
+            g_nsNext = g_nsChanges.size();   // the speed changes of this wall have had their turn
+            g_needSpeedMul = 0.0;
+            g_needSpeedRung = false;
+            g_retired = RetiredBest{};
+            anchors::ladderOn(false);
+            g_curBackoff = kBackOff;
+            spawn(JobRestorePlan, 0, "flying the plan a speed switch replaced");
+            return;
+        }
+    }
     // cfg dpsecauto: point fixes are not getting the deepest wall across -- either the recorder
     // cannot express what is wrong there (it wrote nothing, death after death), or it can and the
     // loop is still not moving. Either way the wall goes to a section solve instead of another
@@ -8429,15 +9114,27 @@ inline void onDeath(long long dt, float deathX) {
         else if (g_cfg.dpSecRent && g_autoWallWork >= autoRungEstimate())
             snprintf(why, sizeof(why), "%.1f s-equiv of work spent (a rung is ~%.1f, %d measured)",
                      g_autoWallWork / 1e6, autoRungEstimate() / 1e6, g_autoRungN);
+        // cfg dpsecboxwait: not at a box a coin waits on -- the ladder's searches are told to enter
+        // it, a section solve is not (config.hpp).
+        if (why[0] && g_cfg.dpSecBoxWait && g_cfg.routePrereq && deathNeed >= 0) {
+            writeResult(std::string("dpsolve:   [secauto] ") + why + " - no section solve: the wall is "
+                        "the box uid " + std::to_string(deathNeed) + " (cfg dpsecboxwait)");
+            why[0] = 0;
+        }
         // cfg dpunseenfirst: the doors before the rung. SubZero 4002 t=13,884: the rent fired a
         // section solve after the third round at the wall (EXHAUSTED); one round later the stall
         // rule turned on the unseen doors (kStallToUnseen) and the next solve walked past the wall.
-        if (why[0] && g_cfg.dpUnseenFirst && g_cfg.dpWorld && !g_needUnseen && !g_secReqPending) {
+        if (why[0] && g_cfg.dpUnseenFirst && !g_needUnseen && !g_secReqPending) {
             g_needUnseen = true;
             writeResult(std::string("dpsolve:   [secauto] ") + why + " - the doors the search has "
                         "not entered first, then the rung (cfg dpunseenfirst)");
             why[0] = 0;
         }
+        // cfg dpneedspeed: before the section solve, whether the speed is what stops this wall. Armed here, the
+        // question is the forced rung the ladder below opens with; the section solve waits for the next round. Ahead
+        // of dpsecrecaway: that one hands the round to the rung after the job, and the job (the fixup recorder, then
+        // the ladder) is where this question is asked -- that level's rounds died away from the wall nearly every time.
+        if (why[0] && g_cfg.dpNeedSpeed && !g_secReqPending && speedArm(why)) why[0] = 0;
         // cfg dpsecrecaway: this round died away from the wall the rung is for -- record this death
         // first (the job), then the rung (poll), as dpsecsolved does. Fired from here, the rung
         // returns before the job is spawned and the death is never recorded.
@@ -8489,7 +9186,7 @@ constexpr long long kDeepRefire = 300;
 // Is there anything to record? A level with no grouped objects has no moving geometry, and a
 // pass over it would only cost a run of the level to write an empty file.
 inline bool levelHasMovingParts() {
-    return g_cfg.dpGroups && grouptrace::g_on && !grouptrace::g_objs.empty();
+    return grouptrace::g_on && !grouptrace::g_objs.empty();
 }
 
 // The very first thing a solve does on a level that has moving parts: run it once with no
@@ -8580,6 +9277,38 @@ inline void finishDeepRecord(const char* why) {
 // None of it is per level. Every option here is one the run asks for by failing, and the same
 // sequence runs on every level -- the ones that never need it never reach this code.
 inline bool escalate() {
+    // Avoid glitches narrows the search on purpose, so a wall it makes is not the level's: before anything
+    // else, ask the same wall again with less of it, one step at a time -- the wave's behaviour first (a floor
+    // on the wave's button changes, a clearance from the terrain; the glitch margins stay), then the margins
+    // halved, quartered, off. Each step holds for the stretch only (the iteration handler puts it all back
+    // kWaveRelaxSpan px past the wall). Said in result.txt and on screen. Not counted against the backstop below.
+    if (glitchSoftenable()) {
+        const bool waveStep = (g_cfg.wavePulse > 1 || g_cfg.waveCentre > 0.0) && !g_waveRelaxed;
+        const char* what;
+        if (waveStep) {
+            g_waveRelaxed = true;
+            what = "the wave behaviour (button floor, terrain clearance) is dropped for this stretch; "
+                   "Avoid glitches' margins stay";
+            notify::show("gdsolver: no route kept the wave's behaviour - continuing with Avoid glitches only",
+                         NotificationIcon::Warning, 6.f);
+        } else {
+            ++g_glitchStage;
+            what = g_glitchStage == 1 ? "Avoid glitches' margins are halved for this stretch"
+                 : g_glitchStage == 2 ? "Avoid glitches' margins are quartered for this stretch"
+                                      : "Avoid glitches' margins are off for this stretch";
+            notify::show(g_glitchStage == 1 ? "gdsolver: no route kept the glitch margins - halving them here"
+                         : g_glitchStage == 2 ? "gdsolver: still no route - quartering the glitch margins here"
+                                              : "gdsolver: still no route - glitch margins off here",
+                         NotificationIcon::Warning, 6.f);
+        }
+        g_waveRelaxedX = g_hudVerifiedX;
+        writeResult(std::string("dpsolve:   no anchor - ") + what);
+        g_curBackoff = kBackOff;
+        if (g_iter == 0) spawn(JobFirstSolve, 0, "solving the start again with less of Avoid glitches");
+        else spawn(JobLadder, g_bestDeath >= 0 ? g_bestDeath : g_lastDeath,
+                   "re-solving with less of Avoid glitches");
+        return true;
+    }
     ++g_escalations;
     if (g_escalations > 12) return false;    // backstop; the flags below already bound this
     // cfg routeprereqafter: a filed coin the loop has not got, whose prerequisite the deepest plan
@@ -8595,7 +9324,7 @@ inline bool escalate() {
         }
     if (routeMoved) {
         // (the wall moved to the box; asked again below)
-    } else if (g_cfg.dpWorld && !g_needUnseen) {
+    } else if (!g_needUnseen) {
         g_needUnseen = true;
         writeResult("dpsolve:   no anchor - trying again with the doors the search has not "
                     "entered");
@@ -9088,6 +9817,14 @@ inline void poll() {
         // is the next rung. If none can be queued, the pin goes as it always did.
         if (g_autoPinOut) {
             g_autoPinOut = false;
+            // cfg dpneedspeed: the wall is asked about its speed before it goes to another section solve, as at the
+            // stall rule (onDeath). A wall the pin holds the ladder at never reaches that rule: every round ends here.
+            if (g_cfg.dpNeedSpeed && !g_secReqPending && speedArm("every rung past the pin is spent")) {
+                g_curBackoff = kBackOff;
+                spawn(JobLadder, g_bestDeath >= 0 ? g_bestDeath : g_lastDeath,
+                      "asking whether the speed stops the wall");
+                return;
+            }
             if (autoFire("every rung past the pin is spent")) return;
             writeResult("dpsolve:   no section solve for this wall - dropping the pin at t="
                         + std::to_string(g_secPin));
@@ -9104,7 +9841,9 @@ inline void poll() {
             if (g_secReqPending) return;   // a command's section solve is queued and takes over
         }
         // Before conceding: everything that changes how the search is set up gets a turn.
-        if (g_iter > 0 && escalate()) return;
+        // (...Avoid glitches' easing included, which is asked at iteration 0 as well)
+        if ((g_iter > 0 || glitchSoftenable()) && escalate())
+            return;
         // ...and so does the section solve, while this wall has a window left: it searches the game,
         // not the model, so "no anchor can be solved" is not its verdict. Measured on official level
         // 22 with coins on (solved on its slice): the run ended here after the one window 200 ticks

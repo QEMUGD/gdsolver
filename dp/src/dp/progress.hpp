@@ -204,6 +204,7 @@ struct SearchOutcome {
     long long resimDead = -1;
     long long resimFirst = -1;   // first such tick, -1 = none
     const char* resimWhy = nullptr;  // cause at that tick; a string literal
+    int resimKind = -1;              // its DIE kind (step.hpp kDeath*), -1 = no death
     // ...and WHICH object, at that same tick. The cause is a category --
     // `cube/hazard` is true of every hazard on the level -- so two walks that
     // die at different ticks for the same reason cannot be told apart from the
@@ -305,6 +306,13 @@ struct SearchOutcome {
     // This call wrote its plan file (--out), and the trace beside it. An early return and a
     // cancelled search write neither, and a ladder's files then still hold the search before.
     bool planWritten = false;
+    // --dumpstate (statefile.hpp): the tick the replay wrote its state at (-1 = none written) and the
+    // --start a call taking it up passes beside --start-state, as stdout's `dumpstate-start:` line
+    // carries it (the mod has no pipe). --start-state: the tick the call took its state from (-1 = not
+    // applied).
+    long long dumpT = -1;
+    std::string dumpStart;
+    long long startStateT = -1;
 
     void reset() {
         verdict = VerdictFailed;
@@ -313,7 +321,7 @@ struct SearchOutcome {
         coinWall = -1;
         workStates = 0;
         rejoinBadT = -1; rejoinBadWhy = nullptr;
-        resimDead = -1; resimFirst = -1; resimWhy = nullptr;
+        resimDead = -1; resimFirst = -1; resimWhy = nullptr; resimKind = -1;
         resimUid = -1; resimObjX = 0.f; resimObjY = 0.f; resimTrig = TouchMask{};
         resimFrame = -1;
         needTrigMask = TouchMask{}; needTrigPassed = TouchMask{};
@@ -330,6 +338,9 @@ struct SearchOutcome {
         trigMapSig = 0;
         unsupported.clear();
         ladder.clear();
+        dumpT = -1;
+        dumpStart.clear();
+        startStateT = -1;
         planWritten = false;
     }
 };

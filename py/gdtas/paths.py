@@ -1,12 +1,13 @@
 """Paths to the repository, the build outputs and the machine-local trees.
 
 Everything here is derived from the location of this file, so a clone works
-without editing. Five environment variables override the machine-local parts:
+without editing. Six environment variables override the machine-local parts:
 
     GDSOLVER_LAB       private tree: official-level dumps, gdref, fixups_log
                        archives, development notes            (default <repo>/../GD-lab)
     GDSOLVER_WORKERS   root of the isolated GD instances      (default <repo>/../GD-workers)
     GDSOLVER_GD_BASE   the frozen game build the workers run  (default <workers>/base-<gd.win>)
+    GDSOLVER_GD_BUILD  its name, when mod.json's gd.win has more than one build (default gd.win)
     GDSOLVER_LEVELDP   the solver executable to drive         (default <repo>/build/dp/...)
     GD_DIR             the Geometry Dash installation         (used by py/dev.py)
 """
@@ -59,7 +60,9 @@ MOD_ID = _MOD_JSON["id"]
 BUILD_MOD = REPO / "build" / f"{MOD_ID}.geode"
 # The build of the game the mod targets, and so the one every measurement here
 # was taken on. The bindings and Geode's own load check follow it.
-GD_VERSION = _MOD_JSON["gd"]["win"]
+# GDSOLVER_GD_BUILD names the frozen build when one gd.win covers two executables (2.209 and its hotfix, say): the manifest of the base and every worker's files are then
+# checked against that name, and the mod built for it says which it was built for (GEODE_COMP_GD_VERSION).
+GD_VERSION = os.environ.get("GDSOLVER_GD_BUILD") or _MOD_JSON["gd"]["win"]
 GEODE_VERSION = _MOD_JSON["geode"]
 # Where a measurement session snapshots the .geode it is using, so that a
 # rebuild of the mainline does not swap the binary under a running measurement.

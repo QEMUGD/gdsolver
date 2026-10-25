@@ -97,8 +97,8 @@ itself do not share), the trigger queue cursor and the snapped object's uid.
 
 ## When a level is sliced
 
-When the cut removes at least **10,000** objects (`slicemin`), and the run is
-not one that has to take coins the copy may not credit (below).
+When the cut removes at least **10,000** objects (`slicemin`). A run that takes
+the level's coins is sliced too; the copy has them (below).
 
 The number is where the copy pays for itself. What an object costs per round
 of the loop was measured on a heavy custom level solved twice from the same
@@ -140,14 +140,31 @@ removable:
 
 ### Coins
 
-A run that has to take the level's coins is not sliced when the level has
-coins the copy may not credit. The copy is an editor-type level, and the game
-credits no secret coin (id 142) in one: lv22 with coins on cleared its copy
-103 times, each with 0 of 3 coins by the game's own count, where the level
-itself credits all three (the game builds no secret coin at all in an
-editor-type level). Whether a user coin (1329) is credited in the copy has not
-been measured, so it is treated the same way until it is. Every official and
-spin-off level with coins has secret coins, so no coin run of them is sliced.
+The copy is an editor-type level, and the game builds a secret coin (id 142)
+only in a main level. `PlayLayer::processCreateObjectsFromSetup` makes each
+object of the level string and adds it to the layer unless the object is of the
+secret-coin type and the level is not a main one. So a plain copy of an official
+level has none of its coins: lv22 with coins on cleared one 103 times, each with
+0 of 3 coins by the game's own count, where the level itself credits all three.
+
+In a run that takes coins, a copy therefore builds its objects under the type of
+the level it was cut from, and only while it builds them: the type goes back
+before `createObjectsFromSetupFinished`, which the last batch of objects calls,
+so the finish, `setupHasCompleted` and the play itself see the editor-type level
+they always saw. The game's check of a main level's string is in
+`PlayLayer::init`, before any object is made, and the copy passes it as an
+editor-type level. The one other read of the type inside that window is for the
+coin itself — whether the player already holds it — and it gets the answer the
+level itself gets. A user coin (id 1329) is built in either type, and the
+calibration rigs, which are editor-type levels, credit it. The session reports
+what the copy has (`slice: the copy has N of the level's N coin(s)`).
+
+A run that does not take coins builds the copy as before, without them.
+
+Nothing a coin earns is recorded from the copy: the game stores the coins
+taken, the completion and the coin achievement at the end of a level only when
+the level is not an editor-type one, and the copy plays as one. Those stores are
+blocked while the bot drives in any case (see the safety section of the README).
 
 ## The flow
 
@@ -165,7 +182,11 @@ spin-off level with coins has secret coins, so no coin run of them is sliced.
    not the level's (lv22's copy read 90.73% where the level read 96.44% at
    the same x and tick); the gate judges the flight on the level.
 3. A clear there is the ordinary clear of a solve: filed and shown under the
-   level's own id.
+   level's own id. The flight is not recorded: nothing reads the recording of a
+   flight that clears, and writing it was most of that flight's time on a heavy
+   level. A flight that dies this way is flown again, recorded, from a fresh
+   swap before the death is read (step 4), so the solve that follows starts from
+   what it always started from.
 4. A death there means the cut was wrong somewhere. The attempt is compared tick
    by tick with the copy's clearing attempt — the player's position, vertical
    velocity and mode; not the flight band, which the game carries from one
@@ -228,6 +249,8 @@ one of the level the session was started on.
 | `slicegiveupcopy` | 1 | giving up at a wall the level shares goes on on a fresh copy, once per wall (step 6) |
 | `slicecount` | 0 | 1 = print the cut's census line and end the session (no solve) |
 | `slicenoposition` | 0 | 1 = drop the decorations read as positions too: a cut that is wrong on purpose, to exercise the verification and the add-back |
+| `sliceverifyrec` | 0 | 1 = the check flights on the level record the moving geometry as every flight does (step 3) |
+| `sliceverifybreak` | 0 | n > 0 = the plan handed to the level keeps its first n inputs: a verification that fails on purpose |
 
 ## What the log says
 

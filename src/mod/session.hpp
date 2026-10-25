@@ -1,7 +1,10 @@
 #pragma once
 // Session lifecycle: configuration from the UI, live commands, loadConfig, endSession.
+#include "mod/gd_compat.hpp"
 #include "mod/dp_bridge.hpp"
 #include "mod/plan_io.hpp"
+#include "mod/profsample.hpp"
+#include "mod/record_gate.hpp"
 
 namespace p1 {
 
@@ -34,6 +37,12 @@ inline bool uiConfigureSession(int levelId) {
         // while the solver runs (dpsolve::start pauses it) and released when the plan lands.
         uiSessionBase(levelId);
         g_cfg.dpSolve = true;
+        // The overlays shown: F1 does not hide them while solving, so a solve must not inherit them
+        // hidden from a replay (session_hotkeys.hpp, F1).
+        if (g_overlayHidden) {
+            g_overlayHidden = false;
+            log::info("panel: overlays shown again for the solve (F1 had hidden them)");
+        }
         grouptrace::g_on = true;   // see the cfg key of the same name
         // Give the session a fast loop to fall back on, so the render key has somewhere to
         // send the frames. Without one, turning the screen off just makes the game invisible
@@ -70,11 +79,21 @@ inline bool uiConfigureSession(int levelId) {
             g_cfg.glitchEmbed = kGlitchEmbedDefault;
             g_cfg.glitchDeco = true;
         }
+        // ...and, as the menu's third choice, the wave's behaviour on top (Config::wavePulse / waveCentre).
+        if (g_uiGlitchMode >= UI_GLITCH_WAVE) {
+            g_cfg.wavePulse = kWavePulseDefault;
+            g_cfg.waveCentre = kWaveCentreDefault;
+            g_cfg.waveTidy = kWaveTidyDefault;
+            g_cfg.waveToggle = kWaveToggleDefault;
+        }
+        // Section search: on unless Options turned it off (cfg dpsecauto=0, the same switch).
+        if (!g_uiSecSolve) g_cfg.dpSecAuto = false;
         // The search (Config::dpSearch): the layer DP unless Options chose an experimental one.
         g_cfg.dpSearch = uiSearchCfg(g_uiSearch);
-        log::info("panel: solve lv{} in-process{}{}, search {}", levelId,
+        log::info("panel: solve lv{} in-process{}{}{}{}, search {}", levelId,
                   g_uiCoins ? " with coins" : "", g_uiGlitch ? " avoiding glitches" : "",
-                  g_cfg.dpSearch);
+                  g_uiGlitchMode >= UI_GLITCH_WAVE ? " (wave behaviour)" : "",
+                  g_uiSecSolve ? "" : ", no section search", g_cfg.dpSearch);
     } else {
         const std::string name = uiSolutionPath(levelId, g_uiCoins);
         std::vector<InputCmd> plan;
@@ -409,11 +428,35 @@ inline void pollCommandFileImpl(const std::string& cmd) {
         endSession("user_quit");
         return;
     }
+    // The leave-the-level key's twin for a driver with no keyboard: ends the session and leaves the
+    // level through PlayLayer::onQuit, as F9 does -- the path on which the game writes what it keeps
+    // when a level is left (the platformer save), which `quit` above never reaches.
+    else if (cmd == "leave") {
+        writeResult("user left the level via cmd");
+        endSession("user_quit_hotkey");
+        return;
+    }
     // The human takeover's end key, for a driver or an agent that has no keyboard on the worker
     // (mod/takeover.hpp): the attempt in progress and the summary are closed as the key closes them.
     else if (cmd == "takeoverend") {
         if (takeover::armed()) takeover::endByKey();
         else writeResult("takeoverend: this session has no takeover");
+        return;
+    }
+    // The key's other half for a driver (cfg takeoverkey): take the input over where the replay
+    // stands, as the first press of the key does.
+    else if (cmd == "takeovernow") {
+        takeover::takeNow("the command");
+        return;
+    }
+    // ...and the replay key's half (F7 while a person plays): leave the mode, replay from the start.
+    else if (cmd == "takeoverreset") {
+        if (takeover::resetByReplayKey()) {
+            // the key's own replay restart follows the reset; a command has to ask for it
+            if (auto* pl = PlayLayer::get()) pl->resetLevel();
+        } else {
+            writeResult("takeoverreset: nothing to leave (only a takeover begun by the key can be)");
+        }
         return;
     }
     else if (cmd == "diag") {
@@ -507,6 +550,9 @@ inline bool loadDpCfg(const std::string& key, const std::string& val) {
     }
     else if (key == "dphorizon") cfgNum(key, val, g_cfg.dpHorizon);
     else if (key == "dpstephorizon") cfgNum(key, val, g_cfg.dpStepHorizon);
+    else if (key == "dphorizongrow") cfgNum(key, val, g_cfg.dpHorizonGrow);
+    else if (key == "dphorizonmax") cfgNum(key, val, g_cfg.dpHorizonMax);
+    else if (key == "dpretirestall") cfgNum(key, val, g_cfg.dpRetireStall);
     else if (key == "dpseed") cfgNum(key, val, g_cfg.dpSeed);
     else if (key == "dpsearch") {
         if (val == "dp" || val == "beam" || val == "montecarlo") g_cfg.dpSearch = val;
@@ -515,7 +561,6 @@ inline bool loadDpCfg(const std::string& key, const std::string& val) {
     else if (key == "dpfastvetoall") g_cfg.dpFastVetoAll = (val == "1");
     else if (key == "dprejoinfull") g_cfg.dpRejoinFull = (val == "1");
     else if (key == "dpoffboardkill") g_cfg.dpOffBoardKill = (val == "1");
-    else if (key == "offboardtp") g_cfg.offBoardTp = (val == "1");
     else if (key == "offboardfree") g_cfg.offBoardFree = (val == "1");
     else if (key == "offboardband") g_cfg.offBoardBand = (val == "1");
     else if (key == "dpmaxiters") cfgNum(key, val, g_cfg.dpMaxIters);
@@ -552,10 +597,12 @@ inline bool loadDpCfg(const std::string& key, const std::string& val) {
     else if (key == "dpseccap") cfgNum(key, val, g_cfg.dpSecCap);
     else if (key == "dpseccaptiers") cfgNum(key, val, g_cfg.dpSecCapTiers);
     else if (key == "dpsecstate") g_cfg.dpSecState = (val == "1");
+    else if (key == "dpneedspeed") g_cfg.dpNeedSpeed = (val == "1");
     else if (key == "dpsecsolved") g_cfg.dpSecSolved = (val == "1");
     else if (key == "dpsecrecaway") g_cfg.dpSecRecAway = (val == "1");
     else if (key == "dpsecreuse") g_cfg.dpSecReuse = (val == "1");
     else if (key == "dpsecrent") g_cfg.dpSecRent = (val == "1");
+    else if (key == "dpsecboxwait") g_cfg.dpSecBoxWait = (val == "1");
     else if (key == "dpsecrungprior") cfgNum(key, val, g_cfg.dpSecRungPrior);
     else if (key == "dpsecwallbudget") cfgNum(key, val, g_cfg.dpSecWallBudget);
     else if (key == "dpunseenfirst") g_cfg.dpUnseenFirst = (val == "1");
@@ -569,9 +616,10 @@ inline bool loadDpCfg(const std::string& key, const std::string& val) {
     else if (key == "slicegiveupcopy") g_cfg.sliceGiveUpCopy = (val == "1");
     else if (key == "slicecount") g_cfg.sliceCount = (val == "1");
     else if (key == "slicenoposition") g_cfg.sliceNoPosition = (val == "1");
+    else if (key == "sliceverifyrec") g_cfg.sliceVerifyRec = (val == "1");
+    else if (key == "sliceverifybreak") cfgNum(key, val, g_cfg.sliceVerifyBreak);
     else if (key == "dpseedplan") g_cfg.dpSeedPlan = val;
     else if (key == "dpshow") cfgNum(key, val, g_cfg.dpShow);
-    else if (key == "dpfixups") g_cfg.dpFixups = (val == "1");
     else if (key == "dpcoinwin") g_cfg.dpCoinWin = (val == "0") ? std::string() : val;
     else if (key == "glitchavoid") {
         const bool on = (val == "1");
@@ -580,13 +628,21 @@ inline bool loadDpCfg(const std::string& key, const std::string& val) {
         g_cfg.glitchEmbed = on ? kGlitchEmbedDefault : 0.0;
         g_cfg.glitchDeco = on;
     }
+    else if (key == "avoidwave") {
+        const bool on = (val == "1");
+        g_cfg.wavePulse = on ? kWavePulseDefault : 0;
+        g_cfg.waveCentre = on ? kWaveCentreDefault : 0.0;
+        g_cfg.waveTidy = on ? kWaveTidyDefault : 0.0;
+        g_cfg.waveToggle = on ? kWaveToggleDefault : 0;
+    }
+    else if (key == "wavepulse") cfgNum(key, val, g_cfg.wavePulse);
+    else if (key == "wavecentre") cfgNum(key, val, g_cfg.waveCentre);
+    else if (key == "wavetidy") cfgNum(key, val, g_cfg.waveTidy);
+    else if (key == "wavetoggle") cfgNum(key, val, g_cfg.waveToggle);
     else if (key == "glitchdeco") g_cfg.glitchDeco = (val == "1");
     else if (key == "glitchportal") cfgNum(key, val, g_cfg.glitchPortal);
     else if (key == "glitchwave") cfgNum(key, val, g_cfg.glitchWave);
     else if (key == "glitchembed") cfgNum(key, val, g_cfg.glitchEmbed);
-    else if (key == "dpworld") g_cfg.dpWorld = (val == "1");
-    else if (key == "dpgroups") g_cfg.dpGroups = (val == "1");
-    else if (key == "needpinrelease") g_cfg.needPinRelease = (val == "1");
     else if (key == "dpbandtrack") g_cfg.dpBandTrack = (val == "1");
     else if (key == "dprotseed") {
         g_cfg.dpRotSeed = val == "A" ? 1 : val == "E" ? 2 : val == "F" ? 3 : val == "S" ? 4 : 0;
@@ -594,7 +650,6 @@ inline bool loadDpCfg(const std::string& key, const std::string& val) {
             writeResult("cfg: dprotseed=" + val + " is not one of off|A|E|F|S - left off");
     }
     else if (key == "dprotseedanchor") g_cfg.dpRotSeedAnchor = (val != "0");
-    else if (key == "rotseedpre") g_cfg.rotSeedPre = (val == "1");
     else if (key == "dpsnapshot") g_cfg.dpSnapshot = (val == "1");
     else if (key == "dpcheck") g_cfg.dpCheck = (val == "1");
     else if (key == "dpcheckobs") g_cfg.dpCheckObs = (val == "1");
@@ -603,13 +658,15 @@ inline bool loadDpCfg(const std::string& key, const std::string& val) {
     else if (key == "dpcapladder") cfgNum(key, val, g_cfg.dpCapLadder);
     else if (key == "dpsigcheck") cfgNum(key, val, g_cfg.dpSigCheck);
     else if (key == "gtrollcheck") cfgNum(key, val, g_cfg.gtRollCheck);
+    else if (key == "gtdeathrow") cfgNum(key, val, g_cfg.gtDeathRow);
+    else if (key == "gtrestrow") cfgNum(key, val, g_cfg.gtRestRow);
+    else if (key == "recenteredfire") cfgNum(key, val, g_cfg.recEnteredFire);
+    else if (key == "windowguard") cfgNum(key, val, g_cfg.windowGuard);
     else if (key == "dpplainbeside") cfgNum(key, val, g_cfg.dpPlainBeside);
     else if (key == "dpinputgrid") cfgNum(key, val, g_cfg.dpInputGrid);
     else if (key == "dpphaseprof") g_cfg.dpPhaseProf = (val == "1");
     else if (key == "memcensus") g_cfg.memCensus = (val == "1");
-    else if (key == "dpspentpad") g_cfg.dpSpentPad = (val == "1");
-    else if (key == "dpxtrack") g_cfg.dpXTrack = (val == "1");
-    else if (key == "dpfineretry") g_cfg.dpFineRetry = (val == "1");
+    else if (key == "dpmodelreanchor") g_cfg.dpModelReanchor = std::atoi(val.c_str());
     else if (key == "dpspentorb") {}   // always on since 2026-09-26; accepted so old cfgs parse
     else if (key == "dpwatchfired") {
         g_cfg.dpWatchFired.clear();
@@ -658,6 +715,23 @@ inline bool loadTraceCfg(const std::string& key, const std::string& val) {
     if (key == "attemptcount") {
         long long k = -1;
         g_attemptCount = (cfgNum(key, val, k) && k >= 0) ? k : -1;
+        return true;
+    }
+    if (key == "rotdbg") {
+        const auto c = val.find(',');
+        if (c != std::string::npos) { g_rotDbg0 = std::atoll(val.c_str()); g_rotDbg1 = std::atoll(val.c_str() + c + 1); }
+        return true;
+    }
+    if (key == "camrand") {
+        g_camRand = val != "0";
+        return true;
+    }
+    if (key == "vtime") {
+        g_vtime = (float)std::atof(val.c_str());
+        return true;
+    }
+    if (key == "attemptauto") {
+        g_attemptAuto = (val != "0");
         return true;
     }
     if (key == "rngseed") {
@@ -752,6 +826,14 @@ inline std::string dpConfigLine() {
 namespace effcfg { inline std::string modCfg(); }
 inline std::string g_cfgDefaults;
 
+// A test instrument (config.hpp, kTestInstruments) asked for by autorun.cfg: honoured only by a build made for measuring; any other says so in
+// the log and ignores the key.
+inline bool testInstrumentAvailable(const std::string& key) {
+    if (kTestInstruments) return true;
+    writeResult("cfg: " + key + " is a test instrument and this build does not carry them; ignored", false);
+    return false;
+}
+
 inline void loadConfig() {
     std::ifstream f(std::string(DATA_DIR) + "/autorun.cfg");
     if (!f.is_open()) return;
@@ -795,6 +877,24 @@ inline void loadConfig() {
                 {"dpslideparts", "ff5d7a4", "d008ee2"},
                 {"dpgroupfire", "ff5d7a4", "c6ddea5"},
                 {"dprotqtoggle", "ff5d7a4", "856a833"},
+                // the 0.6.0 clean-up
+                {"offboardtp", "96efcf7", "d008ee2"},
+                {"dpxtrack", "96efcf7", "d008ee2"},
+                {"portalpayloadlt", "96efcf7", "d008ee2"},
+                {"dpanchorrotstep", "96efcf7", "d008ee2"},
+                {"dpanchorrot2", "96efcf7", "d008ee2"},
+                {"dpfixups", "96efcf7", "a6dd210"},
+                {"dpworld", "96efcf7", "a6dd210"},
+                {"dpgroups", "96efcf7", "a6dd210"},
+                {"anchorboardarm", "96efcf7", "8c8c034"},
+                {"headbandfresh", "96efcf7", "8c8c034"},
+                {"needpinrelease", "96efcf7", "7c739a6"},
+                {"rotseedpre", "96efcf7", "ff34af8"},
+                {"dpspentpad", "96efcf7", "dfb5c64"},
+                {"dpfineretry", "96efcf7", "27ac5dd"},
+                {"anticheatpass", "96efcf7", "d55b964"},
+                {"singlereset", "96efcf7", "0fee83c"},
+                {"snapplayer", "96efcf7", "bd08fca"},
             };
             bool removed = false;
             for (const auto& r : kRemovedCfg)
@@ -813,11 +913,8 @@ inline void loadConfig() {
         // Not in the chain below, which is at MSVC's block-nesting ceiling (C1061).
         if (key == "areaenv") { g_cfg.areaEnv = (val == "1"); continue; }
         if (key == "framebudgetms") { cfgNum(key, val, g_cfg.frameBudgetMs); continue; }
-        if (key == "anticheatpass") { g_cfg.antiCheatPass = (val == "1"); continue; }
-        if (key == "snapplayer") { g_cfg.snapPlayer = (val == "1"); continue; }
         if (key == "snapnodesync") { g_cfg.snapNodeSync = (val == "1"); continue; }
         if (key == "snapnodelog") { g_cfg.snapNodeLog = (val == "1"); continue; }
-        if (key == "singlereset") { g_cfg.singleReset = (val == "1"); continue; }
         if (key == "resetlog") { g_cfg.resetLog = (val == "1"); continue; }
         if (key == "resetdump") { g_cfg.resetDump = (val == "1"); continue; }
         if (key == "resetdumpuids") {
@@ -832,18 +929,47 @@ inline void loadConfig() {
             }
             continue;
         }
-        if (key == "headbandfresh") { g_cfg.headBandFresh = (val == "1"); continue; }
         if (key == "persistworld") { cfgNum(key, val, g_cfg.persistWorld); continue; }
         if (key == "persistitems") { g_cfg.persistItems = val; continue; }
         if (key == "voidband") { g_cfg.voidBand = (val == "1"); continue; }
+        if (key == "voidcredit") { g_cfg.voidCredit = (val == "1"); continue; }
+        if (key == "stallbound") { g_cfg.stallBound = (val == "1"); continue; }
+        if (key == "uishow") { g_cfg.uiShow = val; continue; }
+        // Test hook, cfg `f10auto=<s>,<s>,...`: the mod presses F10 itself at those seconds after the showing starts (a replay's
+        // first frame, or the solve's clear), through the key's own poll (session_hotkeys.hpp), for the checks that cannot send a key.
+        if (key == "f10auto") {
+            itermap::g_f10Auto.clear();
+            size_t p = 0;
+            while (p < val.size()) {
+                size_t q = val.find(',', p);
+                if (q == std::string::npos) q = val.size();
+                itermap::g_f10Auto.push_back(std::atof(val.substr(p, q - p).c_str()));
+                p = q + 1;
+            }
+            continue;
+        }
+        if (key == "replaypanel") { cfgNum(key, val, g_cfg.replayPanel); continue; }
+        if (key == "replaypanelspan") { cfgNum(key, val, g_cfg.replayPanelSpan); continue; }
+        if (key == "replaypanelspeed") { cfgNum(key, val, g_cfg.replayPanelSpeed); continue; }
+        if (key == "dphorizongrowmin") { cfgNum(key, val, g_cfg.dpHorizonGrowMin); continue; }
         if (key == "recprovchain") { g_cfg.recProvChain = (val == "1"); continue; }
         if (key == "cpfollowsection") { g_cfg.cpFollowSection = (val == "1"); continue; }
         if (key == "cpflight") { cfgNum(key, val, g_cfg.cpFlight); continue; }
         if (key == "cpflightprobe") { g_cfg.cpFlightProbe = (val == "1"); continue; }
+        if (key == "cpflightprobecarry") { g_cfg.cpFlightProbeCarry = (val == "1"); continue; }
+        if (key == "cpflightgaps") { g_cfg.cpFlightGaps = (val == "1"); continue; }
+        if (key == "cpdisabled") { g_cfg.cpDisabled = (val == "1"); continue; }
+        if (key == "cpfollowfloats") { g_cfg.cpFollowFloats = (val == "1"); continue; }
+        if (key == "cprotnode") { g_cfg.cpRotNode = (val == "1"); continue; }
+        if (key == "cppersistguard") { g_cfg.cpPersistGuard = (val == "1"); continue; }
+        if (key == "cpcarryparts") { cfgNum(key, val, g_cfg.cpCarryParts); continue; }
         if (key == "cpflightobj") { cfgNum(key, val, g_cfg.cpFlightObj); continue; }
+        if (key == "cpflightobjfrom") { cfgNum(key, val, g_cfg.cpFlightObjFrom); continue; }
+        if (key == "cpflightobjto") { cfgNum(key, val, g_cfg.cpFlightObjTo); continue; }
         if (key == "takeover") { cfgNum(key, val, g_cfg.takeoverAt); continue; }
         if (key == "takeoverx") { cfgNum(key, val, g_cfg.takeoverX); continue; }
         if (key == "takeoverwait") { cfgNum(key, val, g_cfg.takeoverWait); continue; }
+        if (key == "takeoverkey") { g_cfg.takeoverKey = (val == "1"); continue; }
         if (key == "cpflightprobeat") { cfgNum(key, val, g_cfg.cpFlightProbeAt); continue; }
         if (key == "cpflightlayerdiff") { g_cfg.cpFlightLayerDiff = (val == "1"); continue; }
         if (key == "cpflightcarrylog") { g_cfg.cpFlightCarryLog = (val == "1"); continue; }
@@ -920,7 +1046,6 @@ inline void loadConfig() {
         if (key == "secheadaccel") { secsolve::g_headAccel = (val == "1"); continue; }
         // (not on the else-if chain below: one more link there exceeds MSVC's nesting limit, C1061)
         if (key == "secsnapring") { psnap::g_snapRing = (val == "1"); continue; }
-        if (key == "anchorboardarm") { g_cfg.anchorBoardArm = (val == "1"); continue; }
         if (key == "secgracedash") { secsolve::g_graceDash = (val == "1"); continue; }
         if (key == "secwsnapauto") { secsolve::g_wsnapAuto = (val == "1"); continue; }
         if (key == "secwsnapgate") { secsolve::g_wsnapGate = (val == "1"); continue; }
@@ -1067,20 +1192,17 @@ inline void loadConfig() {
         else if (key == "orbtracex") cfgNum(key, val, g_cfg.orbTraceX);
         else if (key == "subringspent") g_cfg.subRingSpent = (val == "1");
         else if (key == "padtrace") g_cfg.padTrace = (val == "1");
-        // Four keys, ONE branch, and not for tidiness: this else-if chain is at
+        // Five keys, ONE branch, and not for tidiness: this else-if chain is at
         // MSVC's block-nesting ceiling, and adding a plain `else if` here is
         // C1061 "nesting level too deep" -- the whole mod stops building. The
         // next key added has to share a branch the same way, or the chain has
         // to be broken into a second function.
         else if (key == "touchpayload" || key == "portalpayload" || key == "capture"
-                 || key == "histride" || key == "portalpayloadlt" || key == "dpanchorrotstep"
-                 || key == "dpanchorrot2")
+                 || key == "histride" || key == "anchorframe2dir")
             (key == "touchpayload" ? g_cfg.touchPayload
              : key == "portalpayload" ? g_cfg.portalPayload
              : key == "histride" ? g_cfg.histRide
-             : key == "portalpayloadlt" ? g_cfg.portalPayloadLt
-             : key == "dpanchorrotstep" ? g_cfg.dpAnchorRotStep
-             : key == "dpanchorrot2" ? g_cfg.dpAnchorRot2
+             : key == "anchorframe2dir" ? g_cfg.anchorFrame2Dir
              : g_cfg.researchCapture)
                 = (val == "1");
         else if (key == "snaptrace") g_cfg.snapTrace = (val == "1");
@@ -1229,6 +1351,23 @@ inline void loadConfig() {
         else if (key == "notifyfix") notify::g_fix = (val == "1");
         else if (key == "music") g_cfg.music = val;
         else if (key == "heapcheck") cfgNum(key, val, g_heapCheckEvery);
+        // The record gate's layers (record_gate.hpp). A chain of their own: the one above was at the
+        // compiler's limit when these were added (see the note below).
+        if (key == "netblock") g_cfg.netBlock = (val == "1");
+        else if (key == "saveblock") g_cfg.saveBlock = (val == "1");
+        else if (key == "memaudit") g_cfg.memAudit = (val == "1");
+        else if (key == "nettest") g_cfg.netTest = (val == "1");
+        else if (key == "savetest") g_cfg.saveTest = (val == "1");
+        // TEST ONLY (see g_netCatchTestOnly): 1 drops every request the process makes, a player's too;
+        // "deathdata" drops only the death-data upload
+        else if (key == "netcatch_testonly") g_netCatchTestOnly = testInstrumentAvailable(key) ? ((val == "1") ? 1 : (val == "deathdata") ? 2 : 0) : 0;
+        // TEST ONLY (see g_netTraceTestOnly): names requests and their answers, never their text
+        else if (key == "nettrace_testonly") g_netTraceTestOnly = testInstrumentAvailable(key) && (val == "1");
+        // TEST ONLY (see g_deathTestTestOnly): makes the game build a death-data upload for the level entered
+        else if (key == "deathtest_testonly") g_deathTestTestOnly = testInstrumentAvailable(key) && (val == "1");
+        // TEST ONLY (see g_heapPhaseTestOnly): a heap check at each step of the section search
+        else if (key == "heapphase_testonly") g_heapPhaseTestOnly = testInstrumentAvailable(key) ? std::max(0, std::atoi(val.c_str())) : 0;
+        else if (key == "phasefile_testonly") g_phaseFileTestOnly = testInstrumentAvailable(key) && (val == "1");
         // Break the chain here (`if`, not `else if`). A huge else-if chain hits MSVC's nesting
         // limit (C1061). The keys are mutually exclusive, so the meaning is unchanged.
         // If a new key triggers C1061, cut one more level the same way
@@ -1349,7 +1488,10 @@ inline void endSession(const std::string& why) {
     writeResult("blocked during this session: achievements=" + std::to_string(g_blockedAch)
         + " stats=" + std::to_string(g_blockedStat)
         + " coins=" + std::to_string(g_blockedCoin)
-        + " progress=" + std::to_string(g_blockedProgress));
+        + " progress=" + std::to_string(g_blockedProgress)
+        + " send=" + std::to_string(g_blockedSend)
+        + " saves=" + std::to_string(g_blockedSave)
+        + " rollover=" + std::to_string(g_rolloverSkipped));
     // Touch triggers the SECOND player set off. dp's markTouched reads p1's
     // position alone, so any count above zero names a trigger the model can
     // never fire -- it would plan against a world where that trigger does not
@@ -1429,7 +1571,7 @@ inline void endSession(const std::string& why) {
         }
         writeResult(m2 + " (hook calls: "
                     + std::to_string(portalseed::g_calls) + ")");
-        // ...and the pads the LAST attempt latched (padseed is per attempt), for cfg dpspentpad.
+        // ...and the pads the LAST attempt latched (padseed is per attempt), for dp --spentpad.
         std::string m3 = "padseed map:";
         first = true;
         for (const auto& kv : padseed::g_first) {
@@ -1460,6 +1602,9 @@ inline void endSession(const std::string& why) {
     writeResult("level record changed: "
         + progressDiff(g_progressAtStart, sampleProgress(g_progressLevel))
         + " (restored " + std::to_string(g_progressRestores) + ")");
+    // ...and the same question asked of everything the game would save, not just the level's own
+    // counters: a record kept under a key nothing here knows about shows up in this one.
+    gate::memaudit::report("session end");
     // rngfix: resets that had already drawn from the trigger seed before it was put back (see
     // rngFixAfterReset). Non-zero means some trigger fired inside the reset itself.
     if (g_rngFix) writeResult("rngfix: trigger seed drawn inside a reset " +
@@ -1467,14 +1612,15 @@ inline void endSession(const std::string& why) {
     g_rngDrawnInReset = 0;
     // attemptone: how often the pin answered (see g_attemptOne). Both 0 on a level that reads
     // neither the attempt count nor a kept item.
-    if (g_cfg.singleReset)
-        writeResult("singlereset: " + std::to_string(g_resetsSkipped) + " resets skipped (no physics since the last reset)");
+    writeResult("singlereset: " + std::to_string(g_resetsSkipped) + " resets skipped (no physics since the last reset)");
     if (g_attemptOne)
         writeResult("attemptone: attempt count read as on attempt 1 " + std::to_string(g_attemptReadsPinned)
                     + " times, kept items not carried over " + std::to_string(g_persistTransfersSkipped)
                     + " times");
-    else if (g_attemptCount >= 0)
-        writeResult("attemptcount: attempt count read as " + std::to_string(g_attemptCount) + " "
+    else if (g_attemptCount >= 0 || g_attemptAutoCount >= 0)
+        writeResult("attemptcount: attempt count read as "
+                    + std::to_string(g_attemptCount >= 0 ? g_attemptCount : g_attemptAutoCount)
+                    + (g_attemptCount >= 0 ? " " : " (attemptauto) ")
                     + std::to_string(g_attemptReadsPinned) + " times");
     g_attemptReadsPinned = 0;
     g_persistTransfersSkipped = 0;
@@ -1504,6 +1650,7 @@ inline void endSession(const std::string& why) {
     // key listed to bring it back. Mod state must not outlive the mod's session; this is the
     // same duty audio::neutral() has for the sound.
     g_secRenderWas = -1;   // a section solve's hold ends with the session too (secRenderHold)
+    g_secRealtimeWas = -1;
     if (g_renderOff) {
         g_renderOff = false;
         writeResult("session_end: rendering restored (the solve had the screen off)");
@@ -1522,6 +1669,9 @@ inline void endSession(const std::string& why) {
     // again).
     if (g_solveMemHeld) dpsolve::releaseSolveMemory("session end");
     dpsolve::memCensus("session end");   // cfg memcensus (print only)
+    // cfg profsample: the report is written here, not at the next frame -- a session that ends the process
+    // (quitwhendone) has no next frame
+    profsample::stopAndReport("session end");
     g_sessionOver = true;
     writeResult("session_end: " + why);
     flushAll();
@@ -1571,7 +1721,7 @@ inline void endSession(const std::string& why) {
         writeResult("suite: done " + std::to_string(suite::g_levels.size()) + " levels");
     if (g_cfg.quitWhenDone) {
         Loader::get()->queueInMainThread([] {
-            utils::game::exit(false);
+            gdcompat::exitGame();
         });
     }
 }

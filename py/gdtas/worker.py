@@ -20,6 +20,14 @@ The traps collected here (each one cost real debugging time, once):
     sits inside `g_started && !g_sessionOver`). No later rerun ever lands, so the only
     way out is to reopen.
   - A hand-configured GD profile costs +400MB of private bytes. Clone the minimal one.
+  - A Geode crash leaves the game's process ALIVE behind a window ("Geode Crash Handler"), and result.txt just stops:
+    a launch that only watches the file learns of it when the stall timer runs out. CrashWatch notices the new
+    geode/crashlogs/*.log or the window on the next poll (SessionResult.crash).
+  - A crash Geode never sees (a fail-fast, abort() or std::terminate after an exception nobody caught: exit status
+    0xC0000409 in ucrtbase) skips Geode's handler: no crash log and no Geode window. Windows' own error reporting takes
+    the process instead -- a WerFault.exe started with `-p <pid>` keeps it alive behind its dialog -- and result.txt
+    just stops the same way. CrashWatch notices a WerFault.exe reporting on one of the worker's processes, and a game
+    that exits with an NTSTATUS error status is a crash too.
 """
 
 from __future__ import annotations
@@ -37,7 +45,7 @@ from . import gdsave
 from .gdsave import MINIMAL_SAVE_XML as _MINIMAL_SAVE_XML
 from .gdsave import decode_save as _decode_save
 from .gdsave import encode_save as _encode_save
-from .gdbase import check_worker
+from .gdbase import check_geode, check_worker, geode_drift_allowed, geode_identity
 from .paths import (BUILD_MOD, MOD_CACHE, MOD_ID, WORKERS_ROOT, gd_save_root,
                     worker_manifest)
 
@@ -61,7 +69,24 @@ BASE_CFG = {
     # off by default in the mod (a player's Solve should not accumulate it); this worker serves
     # the research/cold loop, so it always asks for it explicitly.
     "capture": "1",
+    # The mod leaves the window alone unless told (a player's game is theirs); a worker's window is
+    # held at its launch size, which is part of what a run measured (window_guard.hpp).
+    "windowguard": "1",
+    # The replay panel is on by default for a person watching a solve (the mod's cfg default). Nobody watches a
+    # worker, and the panel would read and parse the level table in a thread beside every level: off here, once, for
+    # every launch that goes through this module (cold runs, collects, the MCP's gd_* tools). A launch for a person
+    # (observe.launch_visible) asks for it.
+    "replaypanel": "0",
 }
+
+# The keys every launch through run_session carries, unless the caller set them.
+WORKER_DEFAULT_KEYS = ("windowguard=1", "replaypanel=0")
+
+
+def with_worker_keys(cfg_lines: list[str]) -> list[str]:
+    """cfg_lines plus the keys every worker launch carries (windowguard=1, replaypanel=0), unless the caller set them."""
+    keys = {ln.split("=", 1)[0].strip() for ln in cfg_lines if "=" in ln}
+    return list(cfg_lines) + [kv for kv in WORKER_DEFAULT_KEYS if kv.split("=", 1)[0] not in keys]
 
 SW_SHOWMINNOACTIVE = 7
 CREATE_NO_WINDOW = 0x08000000
@@ -132,6 +157,38 @@ def processes_under(directory: Path) -> list[int]:
     return pids
 
 
+def _argless(procs: list[tuple[int, list[str]]]) -> list[int]:
+    """The PIDs among (pid, command line) pairs that were started without our data-root argument."""
+    key = f"--geode:{MOD_ID}.data-root="
+    return [pid for pid, cmd in procs if not any(a.startswith(key) for a in cmd)]
+
+
+def argless_processes(worker_dir: Path) -> list[int]:
+    """PIDs of this worker's GDs that carry no --geode:<mod>.data-root argument.
+
+    That is what GeodeUpdater leaves behind when it applies a staged Geode update: it restarts the game itself,
+    without our arguments, and that game waits in the menu with no data root."""
+    import psutil
+    procs = []
+    for pid in processes_under(worker_dir):
+        try:
+            procs.append((pid, psutil.Process(pid).cmdline()))
+        except psutil.Error:
+            pass
+    return _argless(procs)
+
+
+def wait_argless(worker_dir: Path, timeout_s: float) -> list[int]:
+    """Wait up to timeout_s for an argless GD of this worker to appear (the updater starts it a few seconds after
+    the launching game exits); [] when none did."""
+    deadline = time.time() + timeout_s
+    while True:
+        pids = argless_processes(worker_dir)
+        if pids or time.time() >= deadline:
+            return pids
+        time.sleep(1.0)
+
+
 def stop_worker_processes(worker_dir: Path, image: str | None = None) -> None:
     """Reliably remove this worker's GD.
 
@@ -145,6 +202,144 @@ def stop_worker_processes(worker_dir: Path, image: str | None = None) -> None:
                        text=True, creationflags=CREATE_NO_WINDOW)
     if image:
         _wait_gone(image)
+
+
+# ---------- crashes ----------
+#
+# Geode's crash handler writes <worker>/geode/crashlogs/<time>.log (and an empty `last-crashed` marker), then opens a
+# window titled CRASH_WINDOW_TITLE that keeps the game's process alive until someone closes it. A launch that watches
+# only result.txt learns of the crash when the file has been quiet for stall_s; these notice it on the next poll.
+
+CRASH_WINDOW_TITLE = "Geode Crash Handler"
+
+
+def crash_logs(worker_dir: Path) -> set[str]:
+    """Names of the crash logs under this worker's geode/crashlogs (the `last-crashed` marker is not one)."""
+    try:
+        return {p.name for p in (Path(worker_dir) / "geode" / "crashlogs").iterdir()
+                if p.is_file() and p.suffix == ".log"}
+    except OSError:
+        return set()
+
+
+def crash_summary(log: Path, frames: int = 3) -> str:
+    """One line out of a Geode crash log: the exception, the module it was in, the mod blamed and the top stack frames."""
+    try:
+        text = Path(log).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return "(the crash log could not be read)"
+    def field(label: str) -> str:
+        for ln in text.splitlines():
+            if ln.startswith(label):
+                return ln[len(label):].strip()
+        return "?"
+    top: list[str] = []
+    lines = text.splitlines()
+    for i, ln in enumerate(lines):
+        if ln.startswith("== Stack Trace"):
+            top = [x[2:].strip() for x in lines[i + 1:i + 1 + 12] if x.startswith("- ")][:frames]
+            break
+    return (f"exception {field('Exception Code:')} in {Path(field('Faulty Module:')).name}, mod {field('Faulty Mod:')}"
+            + (f"; top frames: {' <- '.join(top)}" if top else ""))
+
+
+def _window_titles(pids: list[int]) -> list[str]:
+    """Titles of the visible top-level windows owned by these processes."""
+    import ctypes
+    from ctypes import wintypes
+    user32 = ctypes.windll.user32
+    want = set(pids)
+    titles: list[str] = []
+    enum_proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    def visit(hwnd, _):
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value in want and user32.IsWindowVisible(hwnd):
+            n = user32.GetWindowTextLengthW(hwnd)
+            buf = ctypes.create_unicode_buffer(n + 1)
+            user32.GetWindowTextW(hwnd, buf, n + 1)
+            titles.append(buf.value)
+        return True
+
+    user32.EnumWindows(enum_proc(visit), 0)
+    return titles
+
+
+def wer_pids(argvs) -> set[int]:
+    """The process ids that WerFault.exe command lines (each an argv list) report on: the value after `-p`, and after `-ip`
+    (the initiating process). The forms Windows is known to use for a crash: `-u -p 7 -s 912`, `-pss -s 580 -p 7 -ip 7`
+    (written from the invocations seen in Windows logs; a live WerFault.exe of this machine has not been read yet)."""
+    out: set[int] = set()
+    for argv in argvs:
+        argv = list(argv)
+        for i, a in enumerate(argv[:-1]):
+            if a.lower() in ("-p", "-ip") and argv[i + 1].isdigit():
+                out.add(int(argv[i + 1]))
+    return out
+
+
+def _wer_handled_pids() -> set[int]:
+    """The processes a WerFault.exe that is running right now reports on. Cheap while there is none: only the image name is read."""
+    import psutil
+    argvs = []
+    for p in psutil.process_iter(["name"]):
+        try:
+            if (p.info.get("name") or "").lower() == "werfault.exe":
+                argvs.append(p.cmdline())
+        except psutil.Error:
+            pass
+    return wer_pids(argvs)
+
+
+_CRASH_STATUS = {0xC0000005: "access violation", 0xC0000409: "fail-fast (abort, std::terminate, stack buffer overrun)",
+                 0xC0000374: "heap corruption", 0xC00000FD: "stack overflow", 0xC0000142: "a DLL failed to initialise"}
+
+
+def crash_exit_status(code) -> str:
+    """Why an exit code is a crash, or "" when it is not: an NTSTATUS error (0xC0000000 and up). A normal exit, and the exit
+    status 1 that a stopped or quit game leaves, are not."""
+    if code is None:
+        return ""
+    u = int(code) & 0xFFFFFFFF
+    if u < 0xC0000000:
+        return ""
+    return f"the game exited with status 0x{u:08X}" + (f" ({_CRASH_STATUS[u]})" if u in _CRASH_STATUS else "")
+
+
+class CrashWatch:
+    """Notices a crash in a worker the poll after it happens: a Geode crash (a new crash log, or Geode's crash window) and a
+    crash Geode never sees (Windows Error Reporting taking one of the worker's processes). Make it before the launch: the
+    crash logs that already exist are not this launch's. check() returns "" or why the launch has crashed."""
+
+    def __init__(self, worker_dir: Path, window_every_s: float = 1.0, titles=None, clock=time.time, wer=None):
+        self.dir = Path(worker_dir)
+        self.before = crash_logs(self.dir)
+        self.window_every_s = window_every_s
+        self._titles = titles or _window_titles
+        self._wer = wer or _wer_handled_pids
+        self._clock = clock
+        self._next_window = 0.0
+        self.reason = ""
+
+    def check(self) -> str:
+        new = sorted(crash_logs(self.dir) - self.before)
+        if new:
+            self.reason = f"Geode wrote a crash log ({new[-1]}): " + crash_summary(self.dir / "geode" / "crashlogs" / new[-1])
+            return self.reason
+        now = self._clock()
+        if now >= self._next_window:
+            self._next_window = now + self.window_every_s
+            pids = processes_under(self.dir)
+            if pids and any(CRASH_WINDOW_TITLE in t for t in self._titles(pids)):
+                self.reason = f"the '{CRASH_WINDOW_TITLE}' window is open"
+                return self.reason
+            hit = sorted(set(pids) & self._wer()) if pids else []
+            if hit:
+                self.reason = (f"Windows Error Reporting is handling a crash of the worker (WerFault.exe -p {hit[0]}): "
+                               "Geode's handler never saw it")
+                return self.reason
+        return ""
 
 
 def ensure_steam() -> None:
@@ -303,7 +498,8 @@ class _WorkerBase:
 
     def _prepare(self, mod_file: Path) -> str:
         """Shared work done just before launch. Returns the hash of the .geode used."""
-        check_worker(self.root, self.exe)   # the frozen build, or no launch at all
+        check_worker(self.root, self.exe, mod_file=mod_file)   # the frozen build the package is for, or no launch at all
+        check_geode(self.root)              # ...and the pinned Geode loader, so no launch applies an update
         snap, digest = snapshot_mod(mod_file)
         mods = self.root / "geode" / "mods"
         mods.mkdir(parents=True, exist_ok=True)
@@ -353,6 +549,8 @@ class SessionResult:
     # deadline, the machine below its memory floor. timed_out is set as well, so the
     # evidence-keeping path for a cut-off level runs unchanged.
     stopped_why: str = ""
+    geode: dict | None = None      # the loader this launch ran on: {"version", "dll_sha256"}
+    crash: str = ""                # why the launch counts as crashed (a new Geode crash log, or the crash window); "" if not
 
 
 class _ResultTail:
@@ -411,7 +609,8 @@ def run_session(worker_id: int, cfg_lines: list[str], timeout_s: float = 360.0,
     `input=t,d` lines may be mixed into cfg_lines as they are (the MOD picks them up
     from autorun.cfg).
 
-    `done_marker` is the line that means the launch is finished. It defaults to
+    `done_marker` is the line that means the launch is finished: a line that BEGINS with it
+    (results.marker_line_seen). It defaults to
     `session_end`, which is right for the one-level-per-process arrangement this
     was written for. A `levels=` suite writes one of those per LEVEL, so a reader
     left on the default would take the first level's log for the whole run and
@@ -425,24 +624,37 @@ def run_session(worker_id: int, cfg_lines: list[str], timeout_s: float = 360.0,
     w = _WorkerBase(worker_id, workers_root)
     w._wait_free()   # confirm it is free before overwriting .geode (fails if held)
     w._prepare(mod_file)
+    geode = geode_identity(w.root)
+    _log(f"worker-{worker_id}: Geode {geode['version']} (Geode.dll {str(geode['dll_sha256'])[:12]})")
     result = w.data / "result.txt"
     result.unlink(missing_ok=True)
     # autorun.cfg carries no BOM. A BOM breaks the test on the very first key.
-    (w.data / "autorun.cfg").write_bytes(("\n".join(cfg_lines) + "\n").encode("ascii"))
+    (w.data / "autorun.cfg").write_bytes(("\n".join(with_worker_keys(cfg_lines)) + "\n").encode("ascii"))
 
+    watch = CrashWatch(w.root)       # before the launch: the crash logs that exist now are not this launch's
     proc = _spawn(w.exe, w.root, w.data, minimized)
     deadline = time.time() + timeout_s
     last_change = time.time()
     tail = _ResultTail(result)
     timed_out, stalled = True, False
     stopped_why = ""
+    exited_early = False
     while time.time() < deadline:
         time.sleep(1.0)
         if proc.poll() is not None:
             timed_out = False
+            # The launching game left on its own. Before the done marker it did not finish: either it
+            # died, or GeodeUpdater is applying a staged Geode update (see below).
+            exited_early = not R.marker_line_seen(done_marker, tail.poll()[0])
+            break
+        crashed = watch.check()
+        if crashed:
+            # Geode's crash window keeps the process alive, so the game would sit here until the stall timer ran out.
+            wall_event("geode-crash", f"worker={worker_id} {crashed}")
+            timed_out = False
             break
         lines_new, seen_new = tail.poll()
-        if done_marker in seen_new:
+        if R.marker_line_seen(done_marker, lines_new):
             timed_out = False
             break
         if guard is not None:
@@ -482,6 +694,20 @@ def run_session(worker_id: int, cfg_lines: list[str], timeout_s: float = 360.0,
                        f" - aborting")
             break
 
+    if exited_early and not geode_drift_allowed():
+        # A launch that applies a staged Geode update exits at once and GeodeUpdater restarts the game a few
+        # seconds later WITHOUT our --geode:<mod>.data-root argument: nothing ran, and that game would sit in the
+        # menu holding the worker. Say so, and stop it, instead of reporting an empty session.
+        stray = wait_argless(w.root, 12.0)
+        if stray:
+            stop_worker_processes(w.root, w.image)
+            _wait_gone(w.image, 20)
+            wall_event("geode-update-relaunch", f"worker={worker_id} argless pid(s) {stray} stopped")
+            raise WorkerError(
+                f"worker-{worker_id}: the launch exited and GeodeUpdater restarted the game without our arguments "
+                f"(a staged Geode update was applied); that game was stopped and nothing ran. "
+                f"The worker is on Geode {geode_identity(w.root)['version']} now: relaunch, and align the workers "
+                f"with the pinned Geode first (gdtas/gdbase.py)")
     if timed_out and not stalled and not stopped_why and proc.poll() is None:
         wall_event("session-timeout",
                    f"worker={worker_id} budget {timeout_s:.0f}s spent")
@@ -500,7 +726,11 @@ def run_session(worker_id: int, cfg_lines: list[str], timeout_s: float = 360.0,
     # Stop-Process is asynchronous. Unless we wait for it to really vanish, the next
     # session gets rejected.
     _wait_gone(w.image, 20)
-    return SessionResult(w.data, R.read_lines(result), code, timed_out, stopped_why)
+    crash = watch.reason or watch.check()      # a crash after the done marker (the exit path) counts too
+    crash = crash or crash_exit_status(code)   # a crash that was answered before anything looked: the status says it
+    if crash and not watch.reason:
+        wall_event("geode-crash", f"worker={worker_id} {crash}")
+    return SessionResult(w.data, R.read_lines(result), code, timed_out, stopped_why, geode, crash)
 
 
 # ---------- resident session (servemode) ----------
@@ -545,6 +775,7 @@ class Worker(_WorkerBase):
                  min_worker_id: int = 0):
         super().__init__(worker_id, workers_root, min_worker_id)
         self.proc: subprocess.Popen | None = None
+        self._watch: CrashWatch | None = None
         self.level = 0
         self.cfg: dict[str, str] = {}
         self.mod_digest = ""
@@ -567,7 +798,19 @@ class Worker(_WorkerBase):
         session that runs to completion without dying (nodeath): once the startup
         attempt runs to completion, cmd.txt is never read again, so a plan sent later
         never runs at all. A string is the plan body, a Path is a plan file.
+
+        A GD already running under this worker that this object did not start is not
+        stopped: open refuses instead. close used to stop whatever ran under the root, so
+        a probe opened on a worker another session was using killed that session's run.
+        reclaim() is the deliberate way to take a worker back. A GD this object started that
+        has exited no longer makes the root its own: what runs there now is someone else's.
         """
+        if not self.is_alive():
+            pids = processes_under(self.root)
+            if pids:
+                raise WorkerError(
+                    f"worker-{self.worker_id} is running a GD this Worker did not start "
+                    f"(PID {pids}); not stopping it. Use another worker, or reclaim() it.")
         self.close()
         self.mod_digest = self._prepare(mod_file)
         self._wait_free()
@@ -596,6 +839,7 @@ class Worker(_WorkerBase):
         # real supply
         P.write_plan(self.data / "plan_in.txt", text)
 
+        self._watch = CrashWatch(self.root)
         self.proc = _spawn(self.exe, self.root, self.data)
         deadline = time.time() + timeout_s
         while time.time() < deadline:
@@ -603,6 +847,11 @@ class Worker(_WorkerBase):
             if not self.is_alive():
                 raise WorkerError(f"worker-{self.worker_id} died right after launch "
                                   f"(exit {self.proc.returncode})")
+            crashed = self._watch.check()
+            if crashed:
+                wall_event("geode-crash", f"worker={self.worker_id} {crashed}")
+                self.close()
+                raise WorkerError(f"worker-{self.worker_id} crashed right after launch: {crashed}")
             if any(R.SESSION_START in l for l in self._read_result()):
                 return self.info()
         self.close()
@@ -611,6 +860,14 @@ class Worker(_WorkerBase):
         raise WorkerError(f"no session_start within {timeout_s}s")
 
     def close(self) -> None:
+        """Stop the GD this object started while it still runs (and what runs under its root
+        with it); a Worker whose GD is not running stops nothing (see open)."""
+        if self.is_alive():
+            stop_worker_processes(self.root, self.image)
+        self.proc = None
+
+    def reclaim(self) -> None:
+        """Stop every GD under this worker's root, whoever started it."""
         stop_worker_processes(self.root, self.image)
         self.proc = None
 
@@ -655,6 +912,12 @@ class Worker(_WorkerBase):
             if not self.is_alive():
                 raise _Reopen("died mid-run "
                               f"(exit {self.proc.returncode if self.proc else '?'})")
+            crashed = self._watch.check() if self._watch else ""
+            if crashed:
+                # the crash window keeps the process alive: without this the run waits out its whole budget
+                wall_event("geode-crash", f"worker={self.worker_id} {crashed}")
+                self.close()
+                raise _Reopen(f"crashed mid-run ({crashed})")
             new = self._read_result()[before:]
             for l in new:
                 if l.startswith(R.SERVE_FAILED):

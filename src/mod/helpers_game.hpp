@@ -193,6 +193,14 @@ inline bool g_heldLoop = false;
 inline float g_heldFade = 0.f;
 inline int g_heldChannel = 0;
 
+// What GD asked the music engine for while a seek ran (print only). The seek holds playMusic and
+// refuses the queued doors, so a song that does not come back after a seek is a question of which
+// door the restart went through -- answered here, and the group's state on arrival in sync().
+inline int g_seekMusicCalls = 0;
+inline void noteSeekMusic(const char* what, const gd::string& path) {
+    if (++g_seekMusicCalls <= 4) log::info("audio: {} during a seek: {}", what, path.c_str());
+}
+
 inline void holdMusic(const gd::string& path, bool loop, float fade, int channel) {
     g_musicHeld = true;
     g_heldPath = path;
@@ -237,6 +245,35 @@ inline void hushNow() {
     g_pausedForSpeed = true;    // the arrival must put it back where the game ended up
 }
 
+// ---- the song's own channels after a seek ----
+//
+// GD pauses the music CHANNEL itself at a death, and a pause on a channel is not lifted by the
+// group's. A plain restart does not care -- GD starts the song again on a new channel -- but a seek
+// that restores a checkpoint (cfg seekcp) does not restart the song, so the channel GD had paused
+// stayed paused under a group this file had unpaused: the group read playing, the channel read
+// paused with audibility 0, and nothing could be heard for the rest of the attempt. Measured
+// 2026-10-13 on lv16, a seek straight after a death: channel 0 paused=true audibility=0.00.
+// So a seek arms this, and the resume that follows it unpauses every channel of the group too.
+inline bool g_seekChannels = false;
+inline void unpauseChannels(FMOD::ChannelGroup* grp) {
+    int n = 0;
+    if (!grp || grp->getNumChannels(&n) != FMOD_OK) return;
+    for (int i = 0; i < n; ++i) {
+        FMOD::Channel* ch = nullptr;
+        if (grp->getChannel(i, &ch) == FMOD_OK && ch) ch->setPaused(false);
+    }
+}
+inline int playingChannels(FMOD::ChannelGroup* grp) {
+    int n = 0, playing = 0;
+    if (!grp || grp->getNumChannels(&n) != FMOD_OK) return 0;
+    for (int i = 0; i < n; ++i) {
+        FMOD::Channel* ch = nullptr;
+        bool p = false;
+        if (grp->getChannel(i, &ch) == FMOD_OK && ch && ch->isPlaying(&p) == FMOD_OK && p) ++playing;
+    }
+    return playing;
+}
+
 // Put the engine back the way GD expects to find it. Called when no session is driving and
 // on the way out of a level -- a leftover pitch would follow the player into the menu.
 inline void neutral() {
@@ -260,6 +297,12 @@ inline void neutral() {
 inline void sync() {
     auto* fe = FMODAudioEngine::sharedEngine();
     if (!fe) return;
+    // (print only) a seek's start and end, for the line at the end of this function
+    static bool s_seekWas = false;
+    const bool seekNow = itermap::seeking();
+    if (seekNow && !s_seekWas) g_seekMusicCalls = 0;
+    const bool seekEnded = !seekNow && s_seekWas;
+    s_seekWas = seekNow;
     if (!g_started || g_sessionOver) { neutral(); return; }
     if (silent()) {
         if (!g_silenced) {
@@ -307,6 +350,7 @@ inline void sync() {
     if (itermap::seeking()) {
         muteForSeek();              // re-fetches the group, so a replaced one is caught
         grp->setPaused(true);
+        g_seekChannels = true;      // the resume after it unpauses the channels too (see above)
         if (!g_musicPaused) {
             g_musicPaused = true;
             g_pausedForSpeed = !gameStopped;   // the arrival must re-seek it
@@ -336,10 +380,15 @@ inline void sync() {
             g_pausedForSpeed = false;
             fe->setMusicTimeMS(songPosMs(), false, 0);
             grp->setPaused(false);
+            if (g_seekChannels) unpauseChannels(grp);
+            g_seekChannels = false;
             log::info("audio: music resumed, seeked to {}ms (tick {})",
                       songPosMs(), (long long)g_tick);
         } else {
             grp->setPaused(false);
+            // (a seek that landed with the game stopped -- a frame-step back -- resumes here)
+            if (g_seekChannels) unpauseChannels(grp);
+            g_seekChannels = false;
             log::info("audio: music resumed");
         }
     } else if (wantPaused && !pausedIs(grp, true)) {
@@ -368,8 +417,10 @@ inline void sync() {
     // The song the seek held back (see holdMusic). Started here, at the end, once the game has
     // stopped moving -- and seeked straight to where it stopped, so it comes in on the beat
     // rather than from the top of the track.
+    bool startedHeld = false;
     if (!itermap::seeking() && g_musicHeld) {
         g_musicHeld = false;
+        startedHeld = true;
         fe->playMusic(g_heldPath, g_heldLoop, g_heldFade, g_heldChannel);
         fe->setMusicTimeMS(songPosMs(), false, 0);
         g_musicPaused = false;
@@ -377,9 +428,54 @@ inline void sync() {
         log::info("audio: the held song started at {}ms (tick {})",
                   songPosMs(), (long long)g_tick);
     }
+    // ...and a seek that landed with no song playing at all: one the level had already stopped
+    // (its end, or a stop GD made at a death), which a checkpoint restore does not start again the
+    // way a plain restart does. Started here the way GD starts it, seeked to where the game is.
+    if (seekEnded && !wantPaused && !startedHeld && playingChannels(fe->m_backgroundMusicChannel) == 0) {
+        if (auto* pl = PlayLayer::get()) {
+            pl->startMusic();
+            fe->setMusicTimeMS(songPosMs(), false, 0);
+            log::info("audio: no song after the seek - started it at {}ms (tick {})", songPosMs(),
+                      (long long)g_tick);
+        }
+    }
     // LAST. Everything above has put the song where the game is; only now is it safe to be
     // audible again (see muteForSeek).
     if (!itermap::seeking()) unmuteAfterSeek();
+    // (print only) what the music group holds once a seek has landed.
+    if (seekEnded) {
+        auto* g = fe->m_backgroundMusicChannel;
+        bool playing = false, paused = false;
+        float vol = -1.f;
+        int nch = -1;
+        if (g) {
+            g->isPlaying(&playing);
+            g->getPaused(&paused);
+            g->getVolume(&vol);
+            g->getNumChannels(&nch);
+        }
+        float aud = -1.f;
+        if (g) g->getAudibility(&aud);
+        log::info("audio: after the seek: music group playing={} paused={} volume={:.2f} audibility={:.2f} "
+                  "channels={} engine music volume={:.2f} ({} music call(s) during the seek)", playing,
+                  paused, vol, aud, nch, fe->getBackgroundMusicVolume(), g_seekMusicCalls);
+        // ...and each channel: a fade GD put on the channel itself (a death's) is invisible at the
+        // group, and audibility is the one number that folds every volume and fade together.
+        for (int i = 0; g && i < nch && i < 4; ++i) {
+            FMOD::Channel* ch = nullptr;
+            if (g->getChannel(i, &ch) != FMOD_OK || !ch) continue;
+            bool cp = false, cpz = false;
+            float cv = -1.f, ca = -1.f;
+            unsigned pos = 0;
+            ch->isPlaying(&cp);
+            ch->getPaused(&cpz);
+            ch->getVolume(&cv);
+            ch->getAudibility(&ca);
+            ch->getPosition(&pos, FMOD_TIMEUNIT_MS);
+            log::info("audio:   channel {}: playing={} paused={} volume={:.2f} audibility={:.2f} at {}ms", i,
+                      cp, cpz, cv, ca, pos);
+        }
+    }
 }
 
 }  // namespace audio

@@ -6543,6 +6543,23 @@ def teleporttrig_unit(x: float, i: int, mode: str = "cube", mini: bool = False,
     return objs, x + TP_PITCH, meta
 
 
+def build_tpback() -> str:
+    """Teleport back rig (dp --tpback): does a passed crossing trigger fire again after a teleport
+    moves the player back? A cube on a paved floor, no input. Gravity triggers at x 300 (0.5) and
+    600 (2); a teleport trigger at x 900 whose target, a Spawn marker, stands at (200, 105); a gravity
+    trigger at 1,500 (1). Measured 2026-10-13: GD jumps back on t=695, keeps gravityMod 2 across 300
+    and 600 again, does not teleport at 900 again, and changes to 1 at x 1,500.85 -- the crossing queue
+    (checkSpawnObjects 0x21a8f0) only moves forward.
+    """
+    objs = floor_run(0.0, 3600.0)
+    objs.append(obj(GRAV_TRIG, 300.0, 165.0, extra={K_GRAV_VALUE: "0.5"}))
+    objs.append(obj(GRAV_TRIG, 600.0, 165.0, extra={K_GRAV_VALUE: "2"}))
+    objs.append(obj(TELEPORT_TRIG, 900.0, 165.0, extra={K_TARGET: "7"}))
+    objs.append(obj(TP_MARK, 200.0, 105.0, extra={K_GROUPS: "7"}))
+    objs.append(obj(GRAV_TRIG, 1500.0, 165.0, extra={K_GRAV_VALUE: "1"}))
+    return header() + ";" + ";".join(objs) + ";"
+
+
 def build_teleporttrig() -> str:
     """Teleport trigger rig: up into the air in every mode, sideways with and
     without ignoreX, straight up (does x snap back to the target's?), ignoreY,
@@ -7220,7 +7237,7 @@ BUILDERS = {"probe": build_probe, "slopes": build_slopes,
             "ceilpush": build_ceilpush, "ceilpushball": build_ceilpushball,
             "ceilpush8": build_ceilpush8, "padedge": build_padedge, "padedge13": build_padedge13, "padfall": build_padfall, "padnorm": build_padnorm,
             "spiderpad": build_spiderpad, "gravtoggle": build_gravtoggle,
-            "teleporttrig": build_teleporttrig,
+            "teleporttrig": build_teleporttrig, "tpback": build_tpback,
             "gravtrig": build_gravtrig, "gravtrig2": build_gravtrig2,
             "followy": build_followy, "teleportorb": build_teleportorb,
             "tpportal": build_tpportal,

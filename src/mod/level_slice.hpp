@@ -78,6 +78,8 @@ inline int g_wallChecks = 0;
 inline bool g_swapInit = false;          // the PlayLayer being built is one of our swaps
 inline size_t g_keptNow = 0;             // objects in the level being played
 inline int g_verifies = 0;               // plans flown on the level itself
+inline int g_heldType = -1;              // a copy's own type while it builds as its level (below)
+inline long long g_origCoins = 0;        // coins (142, 1329) in the level itself
 inline std::chrono::steady_clock::time_point g_t0;
 // The uids (slice.hpp "HOLDING THE UIDS"): each string object's uid in the level itself, and for
 // the copy being played, which of the level's string objects each of its objects is. The copy is
@@ -96,6 +98,19 @@ inline long long g_levelDeath = -1;
 inline double g_levelDeathX = 0.0;
 inline long long g_firstParting = -1;
 inline int g_refFlights = 0;
+// cfg sliceverifyrec (config.hpp): the check flights on the level itself fly without the recording of moving
+// geometry. g_heldFlight: the flight at hand did not record (set at its reset, hooks_playlayer.cpp).
+// g_verifyRecord: the next check flight does -- it is the second flight of a clear check that died unrecorded.
+// g_clearPlan: the plan onSliceCleared handed to the level, for that second flight.
+inline bool g_heldFlight = false;
+inline bool g_verifyRecord = false;
+inline std::vector<InputCmd> g_clearPlan;
+inline int g_reflies = 0;
+
+// Whether a flight that starts now flies without the recording: a check flight on the level itself.
+inline bool flightUnrecorded() {
+    return !g_cfg.sliceVerifyRec && g_phase == Verifying && !g_verifyRecord;
+}
 
 inline int sliceMin() { return g_cfg.sliceMin >= 0 ? g_cfg.sliceMin : kSliceMinDefault; }
 
@@ -137,8 +152,14 @@ inline void reset() {
     g_levelRows.clear();
     g_levelDeath = -1;
     g_levelDeathX = 0.0;
+    g_heldFlight = false;
+    g_verifyRecord = false;
+    g_clearPlan.clear();
+    g_reflies = 0;
     g_firstParting = -1;
     g_refFlights = 0;
+    g_heldType = -1;
+    g_origCoins = 0;
 }
 
 // The level string the layer was built from. The main levels' strings begin with whitespace
@@ -277,8 +298,32 @@ inline GJGameLevel* makeCopy(const std::string& raw) {
     c->m_levelVersion = g_orig->m_levelVersion;
     c->m_twoPlayerMode = g_orig->m_twoPlayerMode;
     // GD's own compression: doing base64+gzip by hand fails to load (level_entry.hpp).
-    c->m_levelString = cocos2d::ZipUtils::compressString(raw, false, 0);
+    c->m_levelString = gdcompat::compressLevelString(raw);
     return c;
+}
+
+// THE COPY'S SECRET COINS. The game builds a secret coin (id 142, object type 22) only in a main
+// level: PlayLayer::processCreateObjectsFromSetup (0x3ad0f0 in 2.2081) makes each object of the
+// string and adds it to the layer unless its type is 22 and the level's type is not Main, the type
+// being read once at the top of each batch. So an editor-type copy has none of them, and a run that
+// takes the level's coins could not take them there (level 22 with coins on cleared its copy 103
+// times, each with 0 of 3 coins by the game's own count).
+//
+// While a copy builds its objects for a run that takes coins, its type therefore reads as the type
+// of the level it was cut from, and only then (hooks_playlayer.cpp). It is put back before
+// createObjectsFromSetupFinished, which the last batch calls, so the finish, setupHasCompleted and
+// the play itself see the editor-type level they saw before; the game's check of a main level's
+// string (verifyLevelIntegrity) is in PlayLayer::init, before any batch. Inside the window the type
+// is read once more, for the coin itself: whether the player already holds it (hasUniqueCoin, from
+// objectFromVector for id 142), which gets the answer the level itself gets. A user coin (id 1329,
+// type 31) is built in either type. A run that does not take coins builds the copy as before.
+//
+// Nothing a coin earns is recorded from the copy. PlayLayer::levelComplete stores the coins taken
+// (processItems: storeSecretCoin, storeUserCoin or the pending user coins), the completion and the
+// coin achievement only for a level whose type is not Editor, and the copy plays as one; and each
+// of those stores is blocked while the bot drives anyway (hooks_system.cpp).
+inline bool buildsAsLevel(GJGameLevel* level) {
+    return g_cfg.coinRoute && g_phase != Off && g_orig && level && level != g_orig;
 }
 
 // What the outgoing layer leaves behind that points into it. The session goes on, so this is
@@ -420,8 +465,15 @@ inline bool maybeSlice(GJBaseGameLayer* l) {
     }
     g_raw = std::move(raw);
     const std::vector<slice::LiveObj> live = liveObjects(l);
+    // A run that takes coins keeps every trigger on the copy. The solver's choice of touch triggers
+    // counts a box whose Move shifts only decoration as one that moves something, so a copy without
+    // those Moves gives the search a different set of boxes and a different route -- the same
+    // physics, another search. On level 22 with coins that route missed its first coin and timed
+    // out after 60 iterations; with the triggers kept the copy's calls read the level's own
+    // trigger table and it cleared with all three coins.
+    const bool dropTriggers = g_cfg.sliceTriggers && !g_cfg.coinRoute;
     g_cut = slice::cut(g_raw, live, slice::Options{!g_cfg.sliceNoPosition, g_cfg.sliceNoTouch,
-                                                   g_cfg.sliceTriggers});
+                                                   dropTriggers});
     if (g_cfg.sliceNoPosition)
         writeResult("slice: cfg slicenoposition - decorations read as positions are dropped too "
                     "(a cut that is wrong on purpose)");
@@ -452,24 +504,13 @@ inline bool maybeSlice(GJBaseGameLayer* l) {
         g_raw.clear();
         return false;
     }
-    // A run that has to take the level's coins is not solved on a copy that may not credit them.
-    // The copy is an editor-type level, and the game credits no SECRET coin (id 142) in one.
-    // Measured on level 22 with coins on: the copy was cleared 103 times, each with 0 of 3 coins by
-    // the game's own count (coingd:), where the level itself credits all three -- and the game
-    // builds no secret coin at all in an editor-type level (the six other official levels that
-    // have three, 2026-09-22). Whether a USER coin (1329) is credited in the copy has not been
-    // measured, so it is treated the same way until it is.
-    const long long coins = std::count_if(live.begin(), live.end(), [](const slice::LiveObj& o) {
+    // A run that takes the level's coins takes them on the copy too: its secret coins are built as
+    // the level builds them (buildsAsLevel), and a user coin is built and credited in an editor-type
+    // level as in a main one (config.hpp, levelFileMain). The copy's own count is reported when it
+    // has been built (hooks_playlayer.cpp createObjectsFromSetupFinished).
+    g_origCoins = std::count_if(live.begin(), live.end(), [](const slice::LiveObj& o) {
         return o.id == 142 || o.id == 1329;
     });
-    if (g_cfg.coinRoute && coins > 0) {
-        writeResult("slice: not used - this run takes the level's " + std::to_string(coins)
-                    + " coin(s), which the editor-type copy is not known to credit (a secret coin "
-                      "is not); solving on the level itself");
-        g_cut = slice::Cut{};
-        g_raw.clear();
-        return false;
-    }
     holdOrig(pl->m_level);
     noteLevelUids(l);
     size_t kept = 0;
@@ -530,13 +571,24 @@ inline bool onSliceCleared(const std::vector<InputCmd>& plan, long long tick) {
     g_clearRows = anchors::g_live;
     g_refEnd = tick;
     g_refCleared = true;
-    g_carry = plan;
+    std::vector<InputCmd> flown = plan;
+    // cfg sliceverifybreak (test only): a plan that does not hold on the level, wrong on purpose
+    if (g_cfg.sliceVerifyBreak > 0 && flown.size() > (size_t)g_cfg.sliceVerifyBreak) {
+        char kb[160];
+        snprintf(kb, sizeof(kb), "slice: cfg sliceverifybreak - the plan handed to the level keeps its first %d "
+                 "of %zu inputs (a verification that fails on purpose)", g_cfg.sliceVerifyBreak, flown.size());
+        writeResult(kb);
+        flown.resize((size_t)g_cfg.sliceVerifyBreak);
+    }
+    g_carry = flown;
     g_carryPending = true;
     g_phase = Verifying;
+    g_verifyRecord = false;   // cfg sliceverifyrec: this check flies without the recording ...
+    g_clearPlan = flown;      // ... and with it again if it dies (onVerifyDeath)
     ++g_verifies;
     char b[256];
     snprintf(b, sizeof(b), "slice: the copy cleared at t=%lld after %d rounds - flying the plan "
-             "on the level itself (%zu inputs)", tick, dpsolve::g_iter, plan.size());
+             "on the level itself (%zu inputs)", tick, dpsolve::g_iter, flown.size());
     writeResult(b);
     g_hudPhase = "verifying the plan on the level itself";
     swapTo(g_orig, g_cut.objects);
@@ -701,6 +753,26 @@ inline bool onRefFlightEnd(long long end, double endX, bool cleared) {
 inline bool onVerifyDeath(long long dt, float deathX) {
     if (g_phase == RefFlight) return onRefFlightEnd(dt, deathX, false);
     if (g_phase != Verifying) return false;
+    // cfg sliceverifyrec: the check of a plan that cleared the copy flew without the recording of moving
+    // geometry, and it died. Where the loop takes this death on the level itself (the add-backs spent, or the two
+    // runs not in step), the solve goes on from that recording -- so the plan is flown again, recorded, on a
+    // fresh swap exactly as the first flight was, and the second flight's death is read as every death of a
+    // recorded check always was. (A wall check's death never reaches the loop: every way out of it below swaps
+    // to a copy.) The first flight's death is not scored, as with every take-over here.
+    if (g_heldFlight && g_refCleared && !g_clearPlan.empty()) {
+        ++g_reflies;
+        g_heldFlight = false;
+        g_verifyRecord = true;
+        char rb[300];
+        snprintf(rb, sizeof(rb), "slice: the check flight on the level died at t=%lld x=%.0f without the "
+                 "recording of moving geometry (cfg sliceverifyrec=0) - flying the plan on the level again "
+                 "with it, then the death is read", dt, (double)deathX);
+        writeResult(rb);
+        g_carry = g_clearPlan;
+        g_carryPending = true;
+        swapTo(g_orig, g_cut.objects);
+        return true;
+    }
     const char* field = "";
     const long long upTo = std::min(dt, g_refEnd >= 0 ? g_refEnd : dt);
     long long pt = partingTick(g_clearRows, anchors::g_live, upTo, &field);

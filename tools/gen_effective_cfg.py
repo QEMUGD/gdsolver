@@ -6,7 +6,7 @@
 
 A cold run's manifest used to record the cfg the driver WROTE and the first solver call's
 flags. Neither shows a default: a mod key nobody wrote, or a dp global the call did not name,
-is invisible in both, so "dpspentpad was on" could only be asserted, not read. These two
+is invisible in both, so "dpmodelreanchor was on" could only be asserted, not read. These two
 functions print the values themselves, read from the variables at run time:
 
   src/mod/cfg_effective.gen.hpp     p1::effcfg::modCfg() -- every autorun.cfg key the mod's
@@ -57,9 +57,7 @@ SHARED = {
     "portalpayload": ["g_cfg.portalPayload"],
     "capture": ["g_cfg.researchCapture"],
     "histride": ["g_cfg.histRide"],
-    "portalpayloadlt": ["g_cfg.portalPayloadLt"],
-    "dpanchorrotstep": ["g_cfg.dpAnchorRotStep"],
-    "dpanchorrot2": ["g_cfg.dpAnchorRot2"],
+    "anchorframe2dir": ["g_cfg.anchorFrame2Dir"],
     "hitboxtrace": ["g_cfg.hitboxTrace"],
     "fieldprobe": ["g_cfg.fieldProbe"],
     "killersite": ["g_cfg.killerSite"],
@@ -69,7 +67,7 @@ SHARED = {
     "worldgates": ["g_cfg.worldGates"],
     "watchspeed": ["g_watchIdx"],
 }
-SHARED_REACH = 600   # characters after the key's test in which its variable must be named
+SHARED_REACH = 700   # characters after the key's test in which its variable must be named
 
 GLOBAL = r"(?:\w+::)*g_\w+(?:\.\w+)*"
 DECL = re.compile(r"\b(?:auto|bool|int|long long|long|double|float|size_t|unsigned|"

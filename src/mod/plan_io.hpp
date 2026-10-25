@@ -67,6 +67,7 @@ inline void resetSessionState() {
     g_endzoneBurn = false;   // carried into the next session, rendering would stay stopped
     g_endzoneLockStart = {};
     g_secRenderWas = -1;     // ...and the same for a section solve's hold (secRenderHold)
+    g_secRealtimeWas = -1;
     speedgate::reset();      // the level changes, so rebuild
     g_paused = false; g_stepTicks = 0; g_realtimeOverride = false;
     g_dpShowSolution = false;   // a finished solve must not make the next session start as one
@@ -161,7 +162,7 @@ inline void resetSessionState() {
     // ...and the human takeover: its checkpoint belongs to this level's layer, and a mode left
     // live would lift the next session's input block.
     takeover::resetState();
-    // cfg singlereset: the last real reset's layer and processCommands count. The skip asks only
+    // The last real reset's layer and processCommands count. The skip asks only
     // whether both are unchanged, and a new level's layer can stand where the last one stood, so
     // left behind they could make its first reset read as a second. The count of skips is printed
     // at every session's end, so it is the session's, and so is its print cap.
@@ -179,6 +180,7 @@ inline void resetSessionState() {
     // level exit does) gave two different answers depending on how the level was re-entered.
     probe::reset(); g_probeRequest = 0;
     g_blockedAch = 0; g_blockedStat = 0; g_blockedCoin = 0; g_blockedProgress = 0;
+    g_blockedSend = 0; g_blockedSave = 0; g_rolloverSkipped = 0;
     g_progressRestores = 0;
     g_soundWhileSolving = 0;
     g_soundBlockedWhileSolving = 0;

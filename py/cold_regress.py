@@ -197,6 +197,21 @@ def run_resolution(workers: list[int]) -> tuple[int | None, str]:
     return vals.pop(), ""
 
 
+def run_geode(workers: list[int]) -> tuple[dict | None, str]:
+    """The Geode loader the run's workers will run on (version, Geode.dll hash, which workers), and a refusal if
+    they disagree: a run whose arms ran on different loaders measured something the comparison cannot name. The
+    pinned loader itself is checked at every launch (gdbase.check_geode); this is the pool as a whole."""
+    from gdtas.gdbase import geode_drift_allowed, geode_identity
+    from gdtas.paths import worker_dir
+    seen = {w: geode_identity(worker_dir(w)) for w in workers}
+    shas = {i["dll_sha256"] for i in seen.values()}
+    if len(shas) > 1 and not geode_drift_allowed():
+        return None, ("the workers run different Geode loaders ("
+                      + ", ".join(f"{w}: {i['version']} {str(i['dll_sha256'])[:8]}" for w, i in seen.items()) + ")")
+    first = seen[workers[0]]
+    return {"version": first["version"], "dll_sha256": first["dll_sha256"], "workers": list(workers)}, ""
+
+
 def iter_cap(lv: int, base: dict) -> int:
     b = base.get(str(lv), {}).get("iters")
     return max(ITER_FLOOR, ITER_MARGIN * (b if b else ITER_UNKNOWN))
@@ -880,6 +895,12 @@ def main(argv=None) -> int:
               f"profile without a resolution key, so this run could not say what it measured")
         return 2
     print(f"  resolution index {a.resolution} (worker {','.join(str(w) for w in used)})")
+    a.geode, why = run_geode(used)
+    if why:
+        print(f"refused: {why}")
+        return 2
+    print(f"  Geode {a.geode['version']} (Geode.dll {str(a.geode['dll_sha256'])[:12]}, "
+          f"worker {','.join(str(w) for w in used)})")
     bres = base.get("_meta", {}).get("resolution")
     if base and bres is None:
         print("  the baseline does not record the resolution it was measured at")
@@ -905,7 +926,7 @@ def main(argv=None) -> int:
     cold_manifest.start(DATA, mod=a.mod, cfg=CFG + list(a.cfg), levels=list(a.levels),
                         arrangement="one-session" if one_session_mode else "per-level",
                         resolution=a.resolution, coins=coins,
-                        build=getattr(a, "build_prov", None))
+                        build=getattr(a, "build_prov", None), geode=a.geode)
     run_guard.note_guard(DATA, guard_settings)
     logs = {lv: DATA / f"coldlog_lv{lv}.txt" for lv in a.levels}
     # A suite has no per-level clock to set, so its default stays where it was;
